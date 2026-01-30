@@ -30,7 +30,7 @@ FEE = 0.002       # 0.2%
 FRICTION = SLIPPAGE + FEE
 
 # Ranges
-STOP_PCT_RANGE = (0.001, 0.02)   # 0.1% to 2%
+STOP_PCT_RANGE = (0, 0.02)   # 0.1% to 2%
 PROFIT_PCT_RANGE = (0.0004, 0.05) # 0.04% to 5%
 
 warnings.filterwarnings("ignore")
@@ -69,7 +69,7 @@ def fetch_binance_history(symbol_pair):
     
     # Calculate timestamps for the last 30 days
     end_time = datetime.now()
-    start_time = end_time - timedelta(days=30)
+    start_time = end_time - timedelta(days=15)
     
     start_ts = int(start_time.timestamp() * 1000)
     end_ts = int(end_time.timestamp() * 1000)
