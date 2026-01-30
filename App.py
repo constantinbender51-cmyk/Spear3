@@ -743,3 +743,5 @@ if __name__ == "__main__":
     print(f"Serving Dashboard at http://localhost:{PORT}/")
     
     with socketserver.TCPServer(("", PORT), ResultsHandler) as httpd:
+        try: httpd.serve_forever()
+        except KeyboardInterrupt: httpd.server_close()
