@@ -21,11 +21,11 @@ N_LINES = 32
 POPULATION_SIZE = 320
 GENERATIONS = 10
 RISK_FREE_RATE = 0.0
-MAX_ASSETS_TO_OPTIMIZE = 1
+MAX_ASSETS_TO_OPTIMIZE = 15
 
 # Costs
 SLIPPAGE = 0.003  # 0.3%
-FEE = 0.002       # 0.4%
+FEE = 0.002       # 0.2%
 # Total friction per side (Price impact + Fee)
 FRICTION = SLIPPAGE + FEE
 
@@ -63,7 +63,7 @@ REPORT_LOCK = threading.Lock()
 creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 creator.create("Individual", list, fitness=creator.FitnessMax)
 
-# --- 2. Precise Data Ingestion (Binance 1 Month) ---
+# --- 2. Precise Data Ingestion (Binance 1 Month - 1m Granularity) ---
 def fetch_binance_history(symbol_pair):
     base_url = "https://api.binance.com/api/v3/klines"
     
@@ -105,7 +105,7 @@ def fetch_binance_history(symbol_pair):
             if last_kline_ts >= end_ts:
                 break
                 
-            time.sleep(0.1) # Mild rate limit respect
+            time.sleep(0.1) 
             
         except Exception as e:
             print(f"CRITICAL API ERROR for {symbol_pair}: {e}")
@@ -130,28 +130,18 @@ def fetch_binance_history(symbol_pair):
     df.set_index('dt', inplace=True)
     df.sort_index(inplace=True)
     
-    # Filter strictly last 30 days (in case API returned earlier context)
+    # Filter strictly last 30 days
     df = df[df.index >= start_time]
 
-    print(f"[{symbol_pair}] Raw 1m Data: {len(df)} rows")
+    print(f"[{symbol_pair}] Raw 1m Data (No Resampling): {len(df)} rows")
 
-    # Resample for GA speed
-    df_1h = df.resample('1h').agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last'
-    }).dropna()
-
-    print(f"[{symbol_pair}] Resampled 1H Data (For GA): {len(df_1h)} rows")
-    
-    if len(df_1h) < 50:
-        print("Insufficient data after resampling.")
+    if len(df) < 500:
+        print("Insufficient data.")
         return None, None
 
-    split_idx = int(len(df_1h) * 0.85)
-    train = df_1h.iloc[:split_idx]
-    test = df_1h.iloc[split_idx:]
+    split_idx = int(len(df) * 0.85)
+    train = df.iloc[:split_idx]
+    test = df.iloc[split_idx:]
     
     return train, test
 
@@ -238,14 +228,12 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
             
             if sl_hit or tp_hit:
                 # APPLY EXIT COSTS
-                # Slippage worsens exit price, Fee reduces PnL
                 if position == 1: 
                     # Sell: Price decreases by slippage
                     effective_exit = exit_price * (1 - SLIPPAGE)
-                    # Buy was: entry_price * (1 + SLIPPAGE) -- Applied at entry
+                    # Buy was: entry_price * (1 + SLIPPAGE)
                     gross_pnl = (effective_exit - (entry_price * (1 + SLIPPAGE))) / (entry_price * (1 + SLIPPAGE))
-                    # Deduct Fee (approximate on notional)
-                    net_pnl = gross_pnl - (FEE * 2) # Entry fee + Exit fee
+                    net_pnl = gross_pnl - (FEE * 2)
                     
                 else: 
                     # Buy to cover: Price increases by slippage
@@ -306,7 +294,6 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
             if new_pos != 0:
                 position = new_pos
                 entry_price = target_line
-                # Entry costs are realized at Exit calculation or effectively embedded in PnL logic above
                 trades.append({'time': ts, 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
 
         equity_curve.append(equity)
@@ -317,7 +304,8 @@ def calculate_sharpe(equity_curve):
     if len(equity_curve) < 2: return -999.0
     returns = pd.Series(equity_curve).pct_change().dropna()
     if returns.std() == 0: return -999.0
-    return np.sqrt(8760) * (returns.mean() / returns.std())
+    # Annualized Sharpe: 1m bars -> minutes in year (525600)
+    return np.sqrt(525600) * (returns.mean() / returns.std())
 
 # --- 4. Genetic Algorithm ---
 def setup_toolbox(min_price, max_price, df_train):
@@ -422,7 +410,7 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
     <body>
         <div class="container-fluid">
             <a href="/" class="btn btn-secondary mb-3">&larr; Back to Dashboard</a>
-            <h1 class="mb-4">{symbol} Grid Strategy GA Results (Binance 30d)</h1>
+            <h1 class="mb-4">{symbol} Grid Strategy GA Results (Binance 30d 1m)</h1>
             <div class="row">
                 <div class="col-md-4">{params_html}</div>
                 <div class="col-md-8 text-right">
@@ -716,7 +704,7 @@ def process_asset(asset_config):
     
     print(f"\n--- Starting Optimization for {sym} ---")
     
-    # 1. Get Data (Binance 30d)
+    # 1. Get Data (Binance 30d 1m)
     train_df, test_df = fetch_binance_history(pair)
     if train_df is None:
         print(f"Skipping {sym} due to data error.")
