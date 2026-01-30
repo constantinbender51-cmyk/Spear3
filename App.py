@@ -25,7 +25,7 @@ MAX_ASSETS_TO_OPTIMIZE = 1
 
 # Costs
 SLIPPAGE = 0.003  # 0.3%
-FEE = 0.004       # 0.4%
+FEE = 0.002    # 0.4%
 # Total friction per side (Price impact + Fee)
 FRICTION = SLIPPAGE + FEE
 
