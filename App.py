@@ -69,7 +69,7 @@ def fetch_binance_history(symbol_pair):
     
     # Calculate timestamps for the last 30 days
     end_time = datetime.now()
-    start_time = end_time - timedelta(days=15)
+    start_time = end_time - timedelta(days=200)
     
     start_ts = int(start_time.timestamp() * 1000)
     end_ts = int(end_time.timestamp() * 1000)
@@ -82,7 +82,7 @@ def fetch_binance_history(symbol_pair):
     while current_start < end_ts:
         params = {
             'symbol': symbol_pair,
-            'interval': '1m',
+            'interval': '15m',
             'startTime': current_start,
             'limit': 1000
         }
