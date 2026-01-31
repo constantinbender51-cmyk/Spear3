@@ -1,288 +1,343 @@
 import pandas as pd
 import numpy as np
-import pygad
 import matplotlib.pyplot as plt
+import requests
+import io
+import os
 import http.server
 import socketserver
-import os
-import sys
-from urllib.parse import urlparse, parse_qs
+from datetime import datetime
+import random
 
-# 1. Fetch Data
+# --- Configuration ---
 DATA_URL = "https://ohlcendpoint.up.railway.app/data/btc1h.csv"
-
-def fetch_data(url):
-    try:
-        df = pd.read_csv(url)
-        df.columns = [c.lower() for c in df.columns]
-        return df
-    except Exception as e:
-        print(f"Error fetching data: {e}")
-        sys.exit(1)
-
-df = fetch_data(DATA_URL)
-prices = df['close'].values
-highs = df['high'].values
-lows = df['low'].values
-opens = df['open'].values
-
-# 2. Split Data (90/10)
-split_idx = int(len(df) * 0.90)
-train_data = {
-    'open': opens[:split_idx],
-    'high': highs[:split_idx],
-    'low': lows[:split_idx],
-    'close': prices[:split_idx]
-}
-test_data = {
-    'open': opens[split_idx:],
-    'high': highs[split_idx:],
-    'low': lows[split_idx:],
-    'close': prices[split_idx:]
-}
-
-# 3. Define Strategy Logic
-# [0-31]: Price Levels
-# [32]: SL % (0.5 - 2.0)
-# [33]: TP % (0.5 - 10.0)
-
-def backtest(genes, data, fee_pct=0.0):
-    levels = genes[:32]
-    sl_pct = genes[32] / 100.0
-    tp_pct = genes[33] / 100.0
-    
-    capital = 10000.0
-    position = 0 # 0: None, 1: Long, -1: Short
-    entry_price = 0.0
-    
-    d_open = data['open']
-    d_high = data['high']
-    d_low = data['low']
-    d_close = data['close']
-    n = len(d_close)
-    
-    equity_curve = [capital]
-    
-    for i in range(n):
-        current_equity = capital
-        
-        # Check Exit
-        if position != 0:
-            exit_executed = False
-            if position == 1: # Long
-                stop_price = entry_price * (1 - sl_pct)
-                target_price = entry_price * (1 + tp_pct)
-                
-                if d_low[i] <= stop_price:
-                    capital = capital * (stop_price / entry_price)
-                    exit_executed = True
-                elif d_high[i] >= target_price:
-                    capital = capital * (target_price / entry_price)
-                    exit_executed = True
-                else:
-                    current_equity = capital * (d_close[i] / entry_price)
-            
-            elif position == -1: # Short
-                stop_price = entry_price * (1 + sl_pct)
-                target_price = entry_price * (1 - tp_pct)
-                
-                if d_high[i] >= stop_price:
-                    capital = capital * (entry_price / stop_price)
-                    exit_executed = True
-                elif d_low[i] <= target_price:
-                    capital = capital * (entry_price / target_price)
-                    exit_executed = True
-                else:
-                    current_equity = capital * (entry_price / d_close[i])
-            
-            if exit_executed:
-                capital = capital * (1 - fee_pct) # Apply fee on exit
-                position = 0
-                current_equity = capital
-
-        # Check Entry
-        if position == 0:
-            candle_low = d_low[i]
-            candle_high = d_high[i]
-            candle_open = d_open[i]
-            
-            for lvl in levels:
-                if candle_low <= lvl <= candle_high:
-                    entry_signal = 0
-                    if candle_open < lvl:
-                        entry_signal = -1
-                    elif candle_open > lvl:
-                        entry_signal = 1
-                    
-                    if entry_signal != 0:
-                        position = entry_signal
-                        entry_price = lvl
-                        capital = capital * (1 - fee_pct) # Apply fee on entry
-                        break
-        
-        equity_curve.append(current_equity if position != 0 else capital)
-
-    return capital, equity_curve
-
-# 4. GA Setup
-price_min = np.min(train_data['low'])
-price_max = np.max(train_data['high'])
-
-gene_space = []
-for _ in range(32):
-    gene_space.append({'low': price_min, 'high': price_max})
-gene_space.append({'low': 0.5, 'high': 2.0})
-gene_space.append({'low': 0.5, 'high': 10.0})
-
-def fitness_func(ga_instance, solution, solution_idx):
-    # Optimize with 0 fee to find best raw strategy
-    final_val, _ = backtest(solution, train_data, fee_pct=0.0)
-    return final_val
-
-num_generations = 40
-num_parents_mating = 4
-sol_per_pop = 10
-num_genes = 34
-
-ga_instance = pygad.GA(num_generations=num_generations,
-                       num_parents_mating=num_parents_mating,
-                       fitness_func=fitness_func,
-                       sol_per_pop=sol_per_pop,
-                       num_genes=num_genes,
-                       gene_space=gene_space,
-                       mutation_type="random",
-                       mutation_percent_genes=10,
-                       suppress_warnings=True)
-
-print("Starting GA Optimization...")
-ga_instance.run()
-
-solution, solution_fitness, solution_idx = ga_instance.best_solution()
-print(f"Best Solution Parameters: {solution}")
-print(f"Training Fitness (Equity): {solution_fitness}")
-
-# 5. Serve Results
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        parsed_path = urlparse(self.path)
-        if parsed_path.path == '/':
-            # Parse Fee
-            params = parse_qs(parsed_path.query)
-            try:
-                # Fee is passed as percentage (e.g. 0.5 for 0.5%)
-                fee_display = float(params.get('fee', [0.0])[0])
-                fee_pct = fee_display / 100.0
-            except ValueError:
-                fee_display = 0.0
-                fee_pct = 0.0
-
-            # Run Backtest with requested fee
-            test_final_val, test_equity = backtest(solution, test_data, fee_pct=fee_pct)
-            
-            # Generate Plot
-            plot_filename = "analysis_chart.png"
-            plt.figure(figsize=(15, 12))
-            
-            # Subplot 1: Price Action
-            ax1 = plt.subplot(2, 1, 1)
-            ax1.plot(test_data['close'], label='Test Close Price', color='black', linewidth=1)
-            optimized_levels = solution[:32]
-            for lvl in optimized_levels:
-                ax1.axhline(y=lvl, color='red', linestyle='--', alpha=0.3, linewidth=0.8)
-            ax1.set_title('Test Data: Price Action with Optimized Reversal Levels')
-            ax1.set_ylabel('Price')
-            ax1.legend(loc='upper right')
-            ax1.grid(True, alpha=0.3)
-            
-            # Subplot 2: Equity Curve
-            ax2 = plt.subplot(2, 1, 2)
-            ax2.plot(test_equity, label='Equity', color='blue', linewidth=1.5)
-            ax2.set_title(f'Strategy Performance (Fee: {fee_display}%)\nFinal Equity: {test_final_val:.2f}')
-            ax2.set_xlabel('Hours')
-            ax2.set_ylabel('Equity ($)')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            plt.savefig(plot_filename)
-            plt.close()
-            
-            # Serve HTML
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            
-            html = f"""
-            <html>
-            <head>
-                <title>Bot Results</title>
-                <style>
-                    body {{ font-family: sans-serif; padding: 20px; color: #333; }}
-                    .container {{ max-width: 1200px; margin: 0 auto; }}
-                    .controls {{ background: #f4f4f4; padding: 20px; border-radius: 5px; margin-bottom: 20px; }}
-                    input[type=range] {{ width: 300px; }}
-                </style>
-                <script>
-                    function updateFee(val) {{
-                        document.getElementById('feeVal').innerText = val + '%';
-                    }}
-                    function applyFee(val) {{
-                        window.location.href = '/?fee=' + val;
-                    }}
-                </script>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>Optimization Results (90/10 Split)</h1>
-                    
-                    <div class="controls">
-                        <label><b>Trading Fee:</b> <span id="feeVal">{fee_display}%</span></label><br>
-                        <input type="range" min="0" max="1" step="0.01" value="{fee_display}" 
-                               oninput="updateFee(this.value)" 
-                               onchange="applyFee(this.value)">
-                        <p><i>Adjust slider to recalculate test performance with fees.</i></p>
-                    </div>
-
-                    <div style="display: flex; justify-content: space-between;">
-                        <div>
-                            <h3>Parameters</h3>
-                            <p><b>Optimized SL:</b> {solution[32]:.2f}%</p>
-                            <p><b>Optimized TP:</b> {solution[33]:.2f}%</p>
-                        </div>
-                        <div>
-                            <h3>Performance</h3>
-                            <p><b>Training Fitness:</b> {solution_fitness:.2f}</p>
-                            <p><b>Test Equity (Fee {fee_display}%):</b> {test_final_val:.2f}</p>
-                        </div>
-                    </div>
-
-                    <hr>
-                    <h2>Visual Analysis</h2>
-                    <img src="/{plot_filename}" style="max-width: 100%; height: auto; border: 1px solid #ccc;" />
-                </div>
-            </body>
-            </html>
-            """
-            self.wfile.write(html.encode())
-        
-        # Serve Plot Image
-        elif parsed_path.path == '/analysis_chart.png':
-            if os.path.exists('analysis_chart.png'):
-                self.send_response(200)
-                self.send_header("Content-type", "image/png")
-                self.end_headers()
-                with open('analysis_chart.png', 'rb') as f:
-                    self.wfile.write(f.read())
-            else:
-                self.send_error(404)
-        else:
-            super().do_GET()
-
+TRAIN_SPLIT = 0.90
 PORT = 8080
-with socketserver.TCPServer(("", PORT), Handler) as httpd:
-    print(f"Serving results at http://localhost:{PORT}")
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        httpd.server_close()
-        print("Server stopped.")
+
+# Trading Costs
+FEE = 0.002
+SLIPPAGE = 0.001
+STOP_LOSS = 0.005
+TAKE_PROFIT = 0.03
+
+# GA Parameters
+POP_SIZE = 50
+GENERATIONS = 20
+MUTATION_RATE = 0.1
+CROSSOVER_RATE = 0.7
+MAX_LEVELS = 100
+MIN_LEVELS = 5
+
+class Backtester:
+    def __init__(self, df):
+        self.df = df.copy().reset_index(drop=True)
+        self.high = self.df['high'].values
+        self.low = self.df['low'].values
+        self.open = self.df['open'].values
+        self.close = self.df['close'].values
+        self.n = len(df)
+
+    def run(self, price_levels):
+        """
+        Executes the strategy.
+        price_levels: sorted list of active price levels.
+        """
+        # State
+        position = 0  # 0: Flat, 1: Long, -1: Short
+        entry_price = 0.0
+        equity = [10000.0]  # Start with 10k
+        trades = []
+        
+        # Pre-calculation for speed
+        if len(price_levels) == 0:
+            return equity, trades
+
+        levels = np.array(price_levels)
+        
+        for t in range(1, self.n):
+            current_equity = equity[-1]
+            h = self.high[t]
+            l = self.low[t]
+            o = self.open[t]
+            prev_c = self.close[t-1]
+            
+            # --- Check Exit (if position exists) ---
+            if position != 0:
+                pnl = 0.0
+                executed = False
+                
+                # Long Exit Logic
+                if position == 1:
+                    sl_price = entry_price * (1 - STOP_LOSS)
+                    tp_price = entry_price * (1 + TAKE_PROFIT)
+                    
+                    # Check worst case: SL hit first if both triggered (Conservative)
+                    if l <= sl_price:
+                        exit_price = sl_price * (1 - SLIPPAGE) # Sell order slippage
+                        pnl = (exit_price - entry_price) / entry_price
+                        # Fee on exit
+                        pnl -= FEE 
+                        executed = True
+                    elif h >= tp_price:
+                        exit_price = tp_price * (1 - SLIPPAGE)
+                        pnl = (exit_price - entry_price) / entry_price
+                        pnl -= FEE
+                        executed = True
+                
+                # Short Exit Logic
+                elif position == -1:
+                    sl_price = entry_price * (1 + STOP_LOSS)
+                    tp_price = entry_price * (1 - TAKE_PROFIT)
+                    
+                    if h >= sl_price:
+                        exit_price = sl_price * (1 + SLIPPAGE) # Buy order slippage
+                        pnl = (entry_price - exit_price) / entry_price
+                        pnl -= FEE
+                        executed = True
+                    elif l <= tp_price:
+                        exit_price = tp_price * (1 + SLIPPAGE)
+                        pnl = (entry_price - exit_price) / entry_price
+                        pnl -= FEE
+                        executed = True
+
+                if executed:
+                    # Apply PnL
+                    new_equity = current_equity * (1 + pnl)
+                    equity.append(new_equity)
+                    trades.append(pnl)
+                    position = 0
+                    entry_price = 0.0
+                    continue # Wait for next candle for new entry (simplify logic)
+            
+            # --- Check Entry (if flat) ---
+            if position == 0:
+                # Find relevant levels
+                # Short: Touch from below (Prev Close < Level <= High)
+                # Long: Touch from above (Prev Close > Level >= Low)
+                
+                # Optimization: Only check levels within candle range
+                relevant_levels = levels[(levels >= l) & (levels <= h)]
+                
+                if len(relevant_levels) > 0:
+                    # Prioritize the one closest to Open or first touched? 
+                    # Assuming limit orders exist, the first one hit is the one closest to Open.
+                    
+                    # Logic: 
+                    # If Short: Price goes UP to level. Level > Prev_Close.
+                    # If Long: Price goes DOWN to level. Level < Prev_Close.
+                    
+                    for lvl in relevant_levels:
+                        if prev_c < lvl <= h:
+                            # Short Trigger
+                            # Entry Price calculation
+                            fill_price = lvl
+                            
+                            # Execute Short
+                            # Sell at fill_price * (1 - slippage)
+                            # Fee deducted immediately from potential
+                            position = -1
+                            # Effective cost basis accounting for slippage/fees in the PnL calculation later
+                            # For tracking "entry_price" we use the raw level, 
+                            # but we account for slippage/fee immediately on equity or at exit?
+                            # Standard: Record executed price.
+                            entry_price = fill_price * (1 - SLIPPAGE) 
+                            # Pay entry fee
+                            current_equity = current_equity * (1 - FEE) 
+                            break 
+                        
+                        elif prev_c > lvl >= l:
+                            # Long Trigger
+                            fill_price = lvl
+                            
+                            # Execute Long
+                            position = 1
+                            entry_price = fill_price * (1 + SLIPPAGE)
+                            current_equity = current_equity * (1 - FEE)
+                            break
+            
+            equity.append(current_equity)
+            
+        return equity, trades
+
+class GeneticOptimizer:
+    def __init__(self, data_train, pop_size=POP_SIZE, generations=GENERATIONS):
+        self.data = data_train
+        self.pop_size = pop_size
+        self.generations = generations
+        self.backtester = Backtester(data_train)
+        
+        # Determine price bounds for gene normalization
+        self.min_price = data_train['low'].min()
+        self.max_price = data_train['high'].max()
+        
+        # Population: [Count, Level_1_Norm, ..., Level_100_Norm]
+        # Gene 0: Number of levels (normalized 0-1, mapped to 5-100)
+        # Genes 1-100: Price levels (normalized 0-1)
+        self.population = np.random.rand(pop_size, MAX_LEVELS + 1)
+        
+    def decode_chromosome(self, chrom):
+        # Decode Count
+        count_norm = chrom[0]
+        count = int(MIN_LEVELS + count_norm * (MAX_LEVELS - MIN_LEVELS))
+        
+        # Decode Levels
+        levels_norm = chrom[1:]
+        # Extract active levels
+        active_indices = np.argsort(levels_norm)[:count] # Pick 'count' levels ? Or just first 'count'? 
+        # Better: Use the first 'count' genes after sorting them to ensure consistency?
+        # Strategy: Take first 'count' from the gene array, map to price, then sort.
+        
+        raw_levels = levels_norm[:count]
+        prices = self.min_price + raw_levels * (self.max_price - self.min_price)
+        prices.sort()
+        return prices
+
+    def fitness(self, chrom):
+        levels = self.decode_chromosome(chrom)
+        equity, _ = self.backtester.run(levels)
+        
+        # Objective: Maximize Final Equity
+        # Penalty for 0 trades (avoid flatlines)
+        if len(equity) == 0 or equity[-1] == 10000.0:
+            return -1.0
+            
+        ret = (equity[-1] - 10000.0) / 10000.0
+        return ret
+
+    def evolve(self):
+        print(f"Starting Optimization: {self.generations} Generations, Pop {self.pop_size}")
+        
+        for gen in range(self.generations):
+            scores = []
+            for i in range(self.pop_size):
+                scores.append(self.fitness(self.population[i]))
+            
+            scores = np.array(scores)
+            best_idx = np.argmax(scores)
+            print(f"Gen {gen+1}/{self.generations} | Best Return: {scores[best_idx]*100:.2f}%")
+            
+            # Selection (Tournament)
+            new_pop = np.zeros_like(self.population)
+            # Elitism
+            new_pop[0] = self.population[best_idx]
+            
+            for i in range(1, self.pop_size):
+                # Tourney size 3
+                candidates = np.random.choice(self.pop_size, 3)
+                parent1_idx = candidates[np.argmax(scores[candidates])]
+                candidates = np.random.choice(self.pop_size, 3)
+                parent2_idx = candidates[np.argmax(scores[candidates])]
+                
+                parent1 = self.population[parent1_idx]
+                parent2 = self.population[parent2_idx]
+                
+                # Crossover
+                if np.random.rand() < CROSSOVER_RATE:
+                    cross_point = np.random.randint(1, len(parent1))
+                    child = np.concatenate((parent1[:cross_point], parent2[cross_point:]))
+                else:
+                    child = parent1.copy()
+                
+                # Mutation
+                mutation_mask = np.random.rand(len(child)) < MUTATION_RATE
+                random_genes = np.random.rand(len(child))
+                child[mutation_mask] = random_genes[mutation_mask]
+                
+                new_pop[i] = child
+            
+            self.population = new_pop
+            
+        # Return best chromosome
+        final_scores = [self.fitness(p) for p in self.population]
+        best_chrom = self.population[np.argmax(final_scores)]
+        return best_chrom
+
+def main():
+    # 1. Download Data
+    print("Downloading data...")
+    r = requests.get(DATA_URL)
+    if r.status_code != 200:
+        raise Exception("Failed to download data")
+    
+    df = pd.read_csv(io.StringIO(r.text))
+    
+    # Clean column names
+    df.columns = [c.lower() for c in df.columns]
+    
+    # 2. Split Data
+    split_idx = int(len(df) * TRAIN_SPLIT)
+    train_df = df.iloc[:split_idx]
+    test_df = df.iloc[split_idx:]
+    
+    print(f"Data loaded. Train size: {len(train_df)}, Test size: {len(test_df)}")
+    
+    # 3. Optimize (GA)
+    optimizer = GeneticOptimizer(train_df)
+    best_chrom = optimizer.evolve()
+    best_levels = optimizer.decode_chromosome(best_chrom)
+    
+    print(f"Optimization complete. Best configuration has {len(best_levels)} levels.")
+    
+    # 4. Test on Out-of-Sample Data
+    bt = Backtester(test_df)
+    equity, trades = bt.run(best_levels)
+    
+    # 5. Generate Reports
+    os.makedirs("output", exist_ok=True)
+    
+    # Plot
+    plt.figure(figsize=(12, 6))
+    plt.plot(equity, label='Equity Curve (Test Data)')
+    plt.title(f'Strategy Performance (Test Data)\nLevels: {len(best_levels)}')
+    plt.xlabel('Candles')
+    plt.ylabel('Capital ($)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('output/equity.png')
+    
+    # Stats
+    total_return = (equity[-1] - 10000) / 10000 * 100
+    win_rate = len([t for t in trades if t > 0]) / len(trades) * 100 if trades else 0
+    
+    html_content = f"""
+    <html>
+    <head><title>Trading Strategy Report</title></head>
+    <body style="font-family: monospace; padding: 20px;">
+        <h1>Optimization Results</h1>
+        <hr>
+        <h2>Metrics (Test Set 10%)</h2>
+        <ul>
+            <li>Initial Capital: $10,000</li>
+            <li>Final Capital: ${equity[-1]:.2f}</li>
+            <li>Total Return: {total_return:.2f}%</li>
+            <li>Total Trades: {len(trades)}</li>
+            <li>Win Rate: {win_rate:.2f}%</li>
+            <li>Optimized Level Count: {len(best_levels)}</li>
+        </ul>
+        <hr>
+        <h2>Equity Curve</h2>
+        <img src="equity.png" style="max-width: 100%;">
+        <hr>
+        <h2>Price Levels</h2>
+        <p>{list(np.round(best_levels, 2))}</p>
+    </body>
+    </html>
+    """
+    
+    with open("output/index.html", "w") as f:
+        f.write(html_content)
+        
+    print(f"Results saved to output/. Serving on port {PORT}...")
+    
+    # 6. Serve
+    os.chdir("output")
+    with socketserver.TCPServer(("", PORT), http.server.SimpleHTTPRequestHandler) as httpd:
+        print(f"Serving at http://localhost:{PORT}")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            httpd.server_close()
+            print("Server stopped.")
+
+if __name__ == "__main__":
+    main()
