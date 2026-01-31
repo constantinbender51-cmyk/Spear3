@@ -13,10 +13,6 @@ DATA_URL = "https://ohlcendpoint.up.railway.app/data/btc1h.csv"
 def fetch_data(url):
     try:
         df = pd.read_csv(url)
-        # Ensure standard column names if necessary, assuming CSV has correct headers
-        # or implies standard OHLC structure.
-        # We assume columns: timestamp, open, high, low, close, volume (or similar)
-        # Normalizing column names to lower case for consistency
         df.columns = [c.lower() for c in df.columns]
         return df
     except Exception as e:
@@ -46,20 +42,23 @@ test_data = {
 
 # 3. Define Strategy Logic
 # Logic: 34 variables.
-# [0-31]: Price Levels (Reversal points)
+# [0-31]: Price Levels
 # [32]: SL % (0.5 - 2.0)
 # [33]: TP % (0.5 - 10.0)
 
+# FEE CONSTANT
+FEE = 0.002  # 0.2% per leg
+
 def backtest(genes, data):
     """
-    Backtests the reversal strategy.
+    Backtests the reversal strategy with fees.
     
     Args:
         genes: Array of 34 floats.
         data: Dict of OHLC numpy arrays.
         
     Returns:
-        Final Equity (assuming starting capital 10000)
+        Final Equity (starting 10000)
     """
     levels = genes[:32]
     sl_pct = genes[32] / 100.0
@@ -69,7 +68,6 @@ def backtest(genes, data):
     position = 0 # 0: None, 1: Long, -1: Short
     entry_price = 0.0
     
-    # Extract arrays for speed
     d_open = data['open']
     d_high = data['high']
     d_low = data['low']
@@ -83,67 +81,71 @@ def backtest(genes, data):
         
         # Check Exit if in position
         if position != 0:
+            exit_signal = False
+            exit_price = 0.0
+            
             if position == 1: # Long
                 stop_price = entry_price * (1 - sl_pct)
                 target_price = entry_price * (1 + tp_pct)
                 
-                # Check Low for SL
                 if d_low[i] <= stop_price:
-                    capital = capital * (stop_price / entry_price)
-                    position = 0
-                # Check High for TP
+                    exit_price = stop_price
+                    exit_signal = True
                 elif d_high[i] >= target_price:
-                    capital = capital * (target_price / entry_price)
-                    position = 0
+                    exit_price = target_price
+                    exit_signal = True
                 else:
-                    # Mark to market (approximate for equity curve)
+                    # Mark to market (no fee applied to unrealized pnl)
                     current_equity = capital * (d_close[i] / entry_price)
             
             elif position == -1: # Short
                 stop_price = entry_price * (1 + sl_pct)
                 target_price = entry_price * (1 - tp_pct)
                 
-                # Check High for SL
                 if d_high[i] >= stop_price:
-                    # Short loss: entry/exit
-                    capital = capital * (entry_price / stop_price) # Inverse relation
-                    position = 0
-                # Check Low for TP
+                    exit_price = stop_price
+                    exit_signal = True
                 elif d_low[i] <= target_price:
-                    capital = capital * (entry_price / target_price)
-                    position = 0
+                    exit_price = target_price
+                    exit_signal = True
                 else:
+                    # Mark to market
                     current_equity = capital * (entry_price / d_close[i])
 
+            if exit_signal:
+                # Calculate gross result
+                if position == 1:
+                    capital = capital * (exit_price / entry_price)
+                else:
+                    capital = capital * (entry_price / exit_price)
+                
+                # Apply Fee on Exit
+                capital = capital * (1 - FEE)
+                
+                position = 0
+                current_equity = capital
+
         # Check Entry if flat
-        # Reversal Logic:
-        # If High >= Level >= Low
-        #   If Open < Level: Hit from below -> Resistance -> Short
-        #   If Open > Level: Hit from above -> Support -> Long
         if position == 0:
-            # Vectorized check is hard with 32 levels, iterating levels
-            # Optimization: Sort levels or use broadcasting? 
-            # For 32 levels and O(N) loop, inner loop is 32 operations. Acceptable.
-            
             candle_low = d_low[i]
             candle_high = d_high[i]
             candle_open = d_open[i]
             
-            # Find levels intersected by this candle
-            # Level must be between Low and High
-            
-            # Simple greedy approach: Take the first valid trigger
             for lvl in levels:
                 if candle_low <= lvl <= candle_high:
                     if candle_open < lvl:
-                        # Crossing Up -> Short
+                        # Short
                         position = -1
                         entry_price = lvl
+                        # Apply Fee on Entry
+                        capital = capital * (1 - FEE)
                         break
                     elif candle_open > lvl:
-                        # Crossing Down -> Long
+                        # Long
                         position = 1
                         entry_price = lvl
+                        # Apply Fee on Entry
+                        capital = capital * (1 - FEE)
                         break
         
         equity_curve.append(current_equity if position != 0 else capital)
@@ -151,29 +153,22 @@ def backtest(genes, data):
     return capital, equity_curve
 
 # 4. GA Setup
-# Gene space: 
-# Levels: Min/Max of training data close
 price_min = np.min(train_data['low'])
 price_max = np.max(train_data['high'])
 
-# Gene Space Definition
-# 32 genes: price_min to price_max
-# 1 gene: SL (0.5 to 2.0)
-# 1 gene: TP (0.5 to 10.0)
 gene_space = []
 for _ in range(32):
-    gene_space.append({'low': price_min, 'high': price_max}) # Levels
-gene_space.append({'low': 0.5, 'high': 2.0}) # SL
-gene_space.append({'low': 0.5, 'high': 10.0}) # TP
+    gene_space.append({'low': price_min, 'high': price_max}) 
+gene_space.append({'low': 0.5, 'high': 2.0}) 
+gene_space.append({'low': 0.5, 'high': 10.0}) 
 
 def fitness_func(ga_instance, solution, solution_idx):
     final_val, _ = backtest(solution, train_data)
-    # Fitness is profit. If profit < 0 (loss), fitness is low.
-    # PyGAD maximizes fitness.
+    # Penalize bankruptcy
+    if final_val <= 0:
+        return 0
     return final_val
 
-# GA Parameters
-# Keeping complexity high as requested
 num_generations = 20
 num_parents_mating = 4
 sol_per_pop = 10
@@ -189,21 +184,20 @@ ga_instance = pygad.GA(num_generations=num_generations,
                        mutation_percent_genes=10,
                        suppress_warnings=True)
 
-print("Starting GA Optimization...")
+print("Starting GA Optimization with 0.2% Fee...")
 ga_instance.run()
 
 # 5. Test Results
 solution, solution_fitness, solution_idx = ga_instance.best_solution()
 print(f"Best Solution Parameters: {solution}")
-print(f"Training Fitness (Equity): {solution_fitness}")
+print(f"Training Fitness (Equity with fees): {solution_fitness}")
 
-# Run on Test Set
 test_final_val, test_equity = backtest(solution, test_data)
-print(f"Test Set Final Equity: {test_final_val}")
+print(f"Test Set Final Equity (with fees): {test_final_val}")
 
 # 6. Plotting
 plt.figure(figsize=(12, 6))
-plt.plot(test_equity, label='Test Equity Curve')
+plt.plot(test_equity, label='Test Equity Curve (Net of Fees)')
 plt.title(f'Strategy Performance on Test Data\nFinal Equity: {test_final_val:.2f}')
 plt.xlabel('Hours')
 plt.ylabel('Equity ($)')
@@ -224,7 +218,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             <html>
             <head><title>Bot Results</title></head>
             <body>
-                <h1>Optimization Results</h1>
+                <h1>Optimization Results (0.2% Fee/Leg Included)</h1>
                 <p><b>Training Equity:</b> {solution_fitness:.2f}</p>
                 <p><b>Test Equity:</b> {test_final_val:.2f}</p>
                 <p><b>Optimized SL:</b> {solution[32]:.2f}%</p>
