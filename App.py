@@ -21,7 +21,7 @@ N_LINES = 32
 POPULATION_SIZE = 320
 GENERATIONS = 10
 RISK_FREE_RATE = 0.0
-MAX_ASSETS_TO_OPTIMIZE = 15
+MAX_ASSETS_TO_OPTIMIZE = 1
 
 # Costs
 SLIPPAGE = 0.003  # 0.3%
@@ -146,7 +146,7 @@ def fetch_binance_history(symbol_pair):
     return train, test
 
 # --- 3. Strategy Logic (With Costs) ---
-def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
+def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0, use_costs=True):
     closes = df['close'].values
     highs = df['high'].values
     lows = df['low'].values
@@ -163,6 +163,10 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
     lines = np.sort(lines)
     trades_completed = 0
     
+    # Determine cost factors
+    current_slippage = SLIPPAGE if use_costs else 0.0
+    current_fee = FEE if use_costs else 0.0
+
     for i in range(1, len(df)):
         current_c = closes[i]
         current_h = highs[i]
@@ -230,17 +234,17 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
                 # APPLY EXIT COSTS
                 if position == 1: 
                     # Sell: Price decreases by slippage
-                    effective_exit = exit_price * (1 - SLIPPAGE)
-                    # Buy was: entry_price * (1 + SLIPPAGE)
-                    gross_pnl = (effective_exit - (entry_price * (1 + SLIPPAGE))) / (entry_price * (1 + SLIPPAGE))
-                    net_pnl = gross_pnl - (FEE * 2)
+                    effective_exit = exit_price * (1 - current_slippage)
+                    # Buy was: entry_price * (1 + current_slippage)
+                    gross_pnl = (effective_exit - (entry_price * (1 + current_slippage))) / (entry_price * (1 + current_slippage))
+                    net_pnl = gross_pnl - (current_fee * 2)
                     
                 else: 
                     # Buy to cover: Price increases by slippage
-                    effective_exit = exit_price * (1 + SLIPPAGE)
-                    # Sell was: entry_price * (1 - SLIPPAGE)
-                    gross_pnl = ((entry_price * (1 - SLIPPAGE)) - effective_exit) / (entry_price * (1 - SLIPPAGE))
-                    net_pnl = gross_pnl - (FEE * 2)
+                    effective_exit = exit_price * (1 + current_slippage)
+                    # Sell was: entry_price * (1 - current_slippage)
+                    gross_pnl = ((entry_price * (1 - current_slippage)) - effective_exit) / (entry_price * (1 - current_slippage))
+                    net_pnl = gross_pnl - (current_fee * 2)
 
                 equity *= (1 + net_pnl)
                 reason = "SL" if sl_hit else "TP"
@@ -329,7 +333,8 @@ def evaluate_genome(individual, df_train):
     stop_pct = np.clip(individual[0], STOP_PCT_RANGE[0], STOP_PCT_RANGE[1])
     profit_pct = np.clip(individual[1], PROFIT_PCT_RANGE[0], PROFIT_PCT_RANGE[1])
     lines = np.array(individual[2:])
-    eq_curve, _, _ = run_backtest(df_train, stop_pct, profit_pct, lines, detailed_log_trades=0)
+    # Training phase: use_costs=False
+    eq_curve, _, _ = run_backtest(df_train, stop_pct, profit_pct, lines, detailed_log_trades=0, use_costs=False)
     return (calculate_sharpe(eq_curve),)
 
 def mutate_custom(individual, indpb, min_p, max_p):
@@ -734,9 +739,10 @@ def process_asset(asset_config):
         "line_prices": list(best_ind[2:])
     }
 
-    # 5. Final Tests (Include Costs)
-    train_curve, _, _ = run_backtest(train_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=0)
-    test_curve, test_trades, hourly_log = run_backtest(test_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=5)
+    # 5. Final Tests (Include Costs for Reporting)
+    # Note: Training curve uses costs here to show realistic performance of the trained individual
+    train_curve, _, _ = run_backtest(train_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=0, use_costs=True)
+    test_curve, test_trades, hourly_log = run_backtest(test_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=5, use_costs=True)
     
     # 6. Generate Initial Report
     with REPORT_LOCK:
