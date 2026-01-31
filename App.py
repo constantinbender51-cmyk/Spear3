@@ -41,24 +41,17 @@ test_data = {
 }
 
 # 3. Define Strategy Logic
-# Logic: 34 variables.
-# [0-31]: Price Levels
-# [32]: SL % (0.5 - 2.0)
-# [33]: TP % (0.5 - 10.0)
-
-# FEE CONSTANT
-FEE = 0.002  # 0.2% per leg
-
-def backtest(genes, data):
+def backtest(genes, data, fee=0.0):
     """
-    Backtests the reversal strategy with fees.
+    Backtests the reversal strategy.
     
     Args:
         genes: Array of 34 floats.
         data: Dict of OHLC numpy arrays.
+        fee: Float (e.g., 0.002 for 0.2%). Deducted on trade exit.
         
     Returns:
-        Final Equity (starting 10000)
+        final_capital, equity_curve
     """
     levels = genes[:32]
     sl_pct = genes[32] / 100.0
@@ -81,8 +74,8 @@ def backtest(genes, data):
         
         # Check Exit if in position
         if position != 0:
-            exit_signal = False
             exit_price = 0.0
+            trade_closed = False
             
             if position == 1: # Long
                 stop_price = entry_price * (1 - sl_pct)
@@ -90,12 +83,11 @@ def backtest(genes, data):
                 
                 if d_low[i] <= stop_price:
                     exit_price = stop_price
-                    exit_signal = True
+                    trade_closed = True
                 elif d_high[i] >= target_price:
                     exit_price = target_price
-                    exit_signal = True
+                    trade_closed = True
                 else:
-                    # Mark to market (no fee applied to unrealized pnl)
                     current_equity = capital * (d_close[i] / entry_price)
             
             elif position == -1: # Short
@@ -104,24 +96,22 @@ def backtest(genes, data):
                 
                 if d_high[i] >= stop_price:
                     exit_price = stop_price
-                    exit_signal = True
+                    trade_closed = True
                 elif d_low[i] <= target_price:
                     exit_price = target_price
-                    exit_signal = True
+                    trade_closed = True
                 else:
-                    # Mark to market
                     current_equity = capital * (entry_price / d_close[i])
 
-            if exit_signal:
-                # Calculate gross result
+            if trade_closed:
+                # Calculate PnL
                 if position == 1:
-                    capital = capital * (exit_price / entry_price)
+                    ratio = exit_price / entry_price
                 else:
-                    capital = capital * (entry_price / exit_price)
+                    ratio = entry_price / exit_price
                 
-                # Apply Fee on Exit
-                capital = capital * (1 - FEE)
-                
+                # Apply Fee on the resulting capital
+                capital = capital * ratio * (1 - fee)
                 position = 0
                 current_equity = capital
 
@@ -134,21 +124,15 @@ def backtest(genes, data):
             for lvl in levels:
                 if candle_low <= lvl <= candle_high:
                     if candle_open < lvl:
-                        # Short
                         position = -1
                         entry_price = lvl
-                        # Apply Fee on Entry
-                        capital = capital * (1 - FEE)
                         break
                     elif candle_open > lvl:
-                        # Long
                         position = 1
                         entry_price = lvl
-                        # Apply Fee on Entry
-                        capital = capital * (1 - FEE)
                         break
         
-        equity_curve.append(current_equity if position != 0 else capital)
+        equity_curve.append(current_equity)
 
     return capital, equity_curve
 
@@ -159,14 +143,12 @@ price_max = np.max(train_data['high'])
 gene_space = []
 for _ in range(32):
     gene_space.append({'low': price_min, 'high': price_max}) 
-gene_space.append({'low': 0.5, 'high': 2.0}) 
-gene_space.append({'low': 0.5, 'high': 10.0}) 
+gene_space.append({'low': 0.5, 'high': 2.0}) # SL
+gene_space.append({'low': 0.5, 'high': 10.0}) # TP
 
 def fitness_func(ga_instance, solution, solution_idx):
-    final_val, _ = backtest(solution, train_data)
-    # Penalize bankruptcy
-    if final_val <= 0:
-        return 0
+    # Fee is 0 during training
+    final_val, _ = backtest(solution, train_data, fee=0.0)
     return final_val
 
 num_generations = 20
@@ -184,26 +166,48 @@ ga_instance = pygad.GA(num_generations=num_generations,
                        mutation_percent_genes=10,
                        suppress_warnings=True)
 
-print("Starting GA Optimization with 0.2% Fee...")
+print("Starting GA Optimization...")
 ga_instance.run()
 
 # 5. Test Results
 solution, solution_fitness, solution_idx = ga_instance.best_solution()
 print(f"Best Solution Parameters: {solution}")
-print(f"Training Fitness (Equity with fees): {solution_fitness}")
+print(f"Training Fitness (No Fee): {solution_fitness}")
 
-test_final_val, test_equity = backtest(solution, test_data)
-print(f"Test Set Final Equity (with fees): {test_final_val}")
+# Run on Test Set WITH 0.2% Fee
+test_final_val, test_equity = backtest(solution, test_data, fee=0.002)
+print(f"Test Set Final Equity (0.2% Fee): {test_final_val}")
 
 # 6. Plotting
-plt.figure(figsize=(12, 6))
-plt.plot(test_equity, label='Test Equity Curve (Net of Fees)')
-plt.title(f'Strategy Performance on Test Data\nFinal Equity: {test_final_val:.2f}')
-plt.xlabel('Hours')
-plt.ylabel('Equity ($)')
-plt.legend()
-plt.grid(True)
-plot_filename = "equity_curve.png"
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+# Subplot 1: Equity Curve
+ax1.plot(test_equity, label='Test Equity (0.2% Fee)', color='blue')
+ax1.set_title(f'Equity Curve\nFinal: ${test_final_val:.2f}')
+ax1.set_ylabel('Equity ($)')
+ax1.legend()
+ax1.grid(True)
+
+# Subplot 2: Price Action + Levels
+ax2.plot(test_data['close'], label='BTC Price', color='black', alpha=0.6)
+ax2.set_title('Test Data Price Action & Optimized Levels')
+ax2.set_ylabel('Price')
+ax2.set_xlabel('Hours')
+
+# Plot the 32 Levels
+levels = solution[:32]
+# Using a loop to plot lines might be slow in rendering if too many, but 32 is fine.
+# We limit the x-axis to the test data range.
+for lvl in levels:
+    ax2.axhline(y=lvl, color='red', linestyle='--', alpha=0.3, linewidth=0.8)
+
+# Dummy line for legend
+ax2.plot([], [], color='red', linestyle='--', label='Reversal Levels')
+ax2.legend()
+ax2.grid(True)
+
+plot_filename = "results_plot.png"
+plt.tight_layout()
 plt.savefig(plot_filename)
 plt.close()
 
@@ -218,13 +222,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             <html>
             <head><title>Bot Results</title></head>
             <body>
-                <h1>Optimization Results (0.2% Fee/Leg Included)</h1>
-                <p><b>Training Equity:</b> {solution_fitness:.2f}</p>
-                <p><b>Test Equity:</b> {test_final_val:.2f}</p>
+                <h1>Optimization Results</h1>
+                <p><b>Training Equity (0% Fee):</b> {solution_fitness:.2f}</p>
+                <p><b>Test Equity (0.2% Fee):</b> {test_final_val:.2f}</p>
                 <p><b>Optimized SL:</b> {solution[32]:.2f}%</p>
                 <p><b>Optimized TP:</b> {solution[33]:.2f}%</p>
-                <h2>Equity Curve</h2>
-                <img src="/{plot_filename}" />
+                <h2>Performance Charts</h2>
+                <img src="/{plot_filename}" style="max-width:100%;" />
             </body>
             </html>
             """
