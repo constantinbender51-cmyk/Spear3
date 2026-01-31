@@ -11,34 +11,31 @@ from datetime import datetime
 import random
 
 # --- Configuration ---
-TRAIN_SPLIT = 0.90
+TRAIN_SPLIT = 0.7
 PORT = 8080
 
-# Trading Costs
+# Trading Costs (Fixed)
 FEE = 0.002
 SLIPPAGE = 0.001
-STOP_LOSS = 0.005
-TAKE_PROFIT = 0.03
 
 # GA Parameters
 POP_SIZE = 100
 GENERATIONS = 40
 MUTATION_RATE = 0.1
 CROSSOVER_RATE = 0.7
-MAX_LEVELS = 100
-MIN_LEVELS = 5
+
+# Strategy Constraints
+NUM_LEVELS = 50  # Fixed as requested
+# Optimization Bounds
+MIN_SL = 0.001   # 0.1%
+MAX_SL = 0.05    # 5.0%
+MIN_TP = 0.005   # 0.5%
+MAX_TP = 0.10    # 10.0%
 
 def fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01"):
-    """
-    Fetches historical OHLC data from Binance API.
-    """
     base_url = "https://api.binance.com/api/v3/klines"
-    
-    # Convert start string to ms timestamp
     start_dt = datetime.strptime(start_str, "%Y-%m-%d")
     start_ts = int(start_dt.timestamp() * 1000)
-    
-    # End time is now
     end_ts = int(time.time() * 1000)
     
     all_data = []
@@ -63,19 +60,14 @@ def fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01"):
                 break
                 
             all_data.extend(data)
-            
-            # Update start time: Last candle open time + 1 interval (1h = 3600000ms)
             last_open_time = data[-1][0]
             current_start = last_open_time + 3600000
             
-            # Progress indicator
             last_date = datetime.fromtimestamp(last_open_time / 1000)
             print(f"Fetched up to {last_date}...", end='\r')
             
             if current_start > end_ts:
                 break
-                
-            # Rate limit protection (Binance is generous, but safe side)
             time.sleep(0.1)
             
         except Exception as e:
@@ -84,14 +76,11 @@ def fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01"):
             
     print(f"\nDownload complete. Total candles: {len(all_data)}")
     
-    # Binance Columns: 
-    # 0: Open time, 1: Open, 2: High, 3: Low, 4: Close, 5: Volume, ...
     df = pd.DataFrame(all_data, columns=[
         "open_time", "open", "high", "low", "close", "volume", 
         "close_time", "q_vol", "trades", "tb_base", "tb_quote", "ignore"
     ])
     
-    # Type conversion
     cols = ["open", "high", "low", "close", "volume"]
     for c in cols:
         df[c] = df[c].astype(float)
@@ -107,7 +96,10 @@ class Backtester:
         self.close = self.df['close'].values
         self.n = len(df)
 
-    def run(self, price_levels):
+    def run(self, price_levels, stop_loss, take_profit):
+        """
+        Executes the strategy with dynamic SL/TP.
+        """
         position = 0
         entry_price = 0.0
         equity = [10000.0]
@@ -125,13 +117,14 @@ class Backtester:
             o = self.open[t]
             prev_c = self.close[t-1]
             
+            # --- Check Exit ---
             if position != 0:
                 pnl = 0.0
                 executed = False
                 
                 if position == 1:
-                    sl_price = entry_price * (1 - STOP_LOSS)
-                    tp_price = entry_price * (1 + TAKE_PROFIT)
+                    sl_price = entry_price * (1 - stop_loss)
+                    tp_price = entry_price * (1 + take_profit)
                     
                     if l <= sl_price:
                         exit_price = sl_price * (1 - SLIPPAGE)
@@ -145,8 +138,8 @@ class Backtester:
                         executed = True
                 
                 elif position == -1:
-                    sl_price = entry_price * (1 + STOP_LOSS)
-                    tp_price = entry_price * (1 - TAKE_PROFIT)
+                    sl_price = entry_price * (1 + stop_loss)
+                    tp_price = entry_price * (1 - take_profit)
                     
                     if h >= sl_price:
                         exit_price = sl_price * (1 + SLIPPAGE)
@@ -167,12 +160,15 @@ class Backtester:
                     entry_price = 0.0
                     continue 
             
+            # --- Check Entry ---
             if position == 0:
+                # Filter relevant levels strictly within high/low
                 relevant_levels = levels[(levels >= l) & (levels <= h)]
                 
                 if len(relevant_levels) > 0:
                     for lvl in relevant_levels:
                         if prev_c < lvl <= h:
+                            # Short Trigger
                             fill_price = lvl
                             position = -1
                             entry_price = fill_price * (1 - SLIPPAGE) 
@@ -180,6 +176,7 @@ class Backtester:
                             break 
                         
                         elif prev_c > lvl >= l:
+                            # Long Trigger
                             fill_price = lvl
                             position = 1
                             entry_price = fill_price * (1 + SLIPPAGE)
@@ -200,30 +197,43 @@ class GeneticOptimizer:
         self.min_price = data_train['low'].min()
         self.max_price = data_train['high'].max()
         
-        self.population = np.random.rand(pop_size, MAX_LEVELS + 1)
+        # Chromosome Structure:
+        # 0: Stop Loss (Normalized)
+        # 1: Take Profit (Normalized)
+        # 2 to 51: Price Levels (Normalized, Fixed Count 50)
+        self.gene_length = 2 + NUM_LEVELS
+        self.population = np.random.rand(pop_size, self.gene_length)
         
     def decode_chromosome(self, chrom):
-        count_norm = chrom[0]
-        count = int(MIN_LEVELS + count_norm * (MAX_LEVELS - MIN_LEVELS))
-        levels_norm = chrom[1:]
+        # 1. Decode SL
+        sl_norm = chrom[0]
+        stop_loss = MIN_SL + sl_norm * (MAX_SL - MIN_SL)
         
-        raw_levels = levels_norm[:count]
-        prices = self.min_price + raw_levels * (self.max_price - self.min_price)
+        # 2. Decode TP
+        tp_norm = chrom[1]
+        take_profit = MIN_TP + tp_norm * (MAX_TP - MIN_TP)
+        
+        # 3. Decode Levels
+        levels_norm = chrom[2:]
+        prices = self.min_price + levels_norm * (self.max_price - self.min_price)
         prices.sort()
-        return prices
+        
+        return prices, stop_loss, take_profit
 
     def fitness(self, chrom):
-        levels = self.decode_chromosome(chrom)
-        equity, _ = self.backtester.run(levels)
+        levels, sl, tp = self.decode_chromosome(chrom)
+        equity, _ = self.backtester.run(levels, sl, tp)
         
         if len(equity) == 0 or equity[-1] == 10000.0:
             return -1.0
             
+        # Return total % return
         ret = (equity[-1] - 10000.0) / 10000.0
         return ret
 
     def evolve(self):
-        print(f"Starting Optimization: {self.generations} Generations, Pop {self.pop_size}")
+        print(f"Starting Optimization: {self.generations} Gens, Pop {self.pop_size}, Levels {NUM_LEVELS}")
+        print(f"Optimizing SL ({MIN_SL*100}%-{MAX_SL*100}%) and TP ({MIN_TP*100}%-{MAX_TP*100}%)")
         
         for gen in range(self.generations):
             scores = []
@@ -232,28 +242,36 @@ class GeneticOptimizer:
             
             scores = np.array(scores)
             best_idx = np.argmax(scores)
-            print(f"Gen {gen+1}/{self.generations} | Best Return: {scores[best_idx]*100:.2f}%")
+            best_ret = scores[best_idx]
+            
+            # Extract current best params for logging
+            _, b_sl, b_tp = self.decode_chromosome(self.population[best_idx])
+            print(f"Gen {gen+1}/{self.generations} | Ret: {best_ret*100:.2f}% | SL: {b_sl*100:.2f}% | TP: {b_tp*100:.2f}%")
             
             new_pop = np.zeros_like(self.population)
+            # Elitism
             new_pop[0] = self.population[best_idx]
             
             for i in range(1, self.pop_size):
-                candidates = np.random.choice(self.pop_size, 3)
-                parent1_idx = candidates[np.argmax(scores[candidates])]
-                candidates = np.random.choice(self.pop_size, 3)
-                parent2_idx = candidates[np.argmax(scores[candidates])]
+                # Tournament Selection
+                cands = np.random.choice(self.pop_size, 3)
+                p1_idx = cands[np.argmax(scores[cands])]
+                cands = np.random.choice(self.pop_size, 3)
+                p2_idx = cands[np.argmax(scores[cands])]
                 
-                parent1 = self.population[parent1_idx]
-                parent2 = self.population[parent2_idx]
+                parent1 = self.population[p1_idx]
+                parent2 = self.population[p2_idx]
                 
+                # Crossover
                 if np.random.rand() < CROSSOVER_RATE:
-                    cross_point = np.random.randint(1, len(parent1))
+                    cross_point = np.random.randint(1, self.gene_length)
                     child = np.concatenate((parent1[:cross_point], parent2[cross_point:]))
                 else:
                     child = parent1.copy()
                 
-                mutation_mask = np.random.rand(len(child)) < MUTATION_RATE
-                random_genes = np.random.rand(len(child))
+                # Mutation
+                mutation_mask = np.random.rand(self.gene_length) < MUTATION_RATE
+                random_genes = np.random.rand(self.gene_length)
                 child[mutation_mask] = random_genes[mutation_mask]
                 
                 new_pop[i] = child
@@ -286,7 +304,7 @@ def plot_candlesticks(df, levels, filename="ohlc.png"):
 
     xmin, xmax = 0, len(df_plot)
     for level in levels:
-        plt.hlines(level, xmin, xmax, colors='blue', linestyles='dashed', alpha=0.6, linewidth=0.8)
+        plt.hlines(level, xmin, xmax, colors='blue', linestyles='dashed', alpha=0.5, linewidth=0.8)
 
     plt.title('Test Data: OHLC & Optimized Price Levels')
     plt.xlabel('Time (Candles)')
@@ -297,7 +315,7 @@ def plot_candlesticks(df, levels, filename="ohlc.png"):
     plt.close()
 
 def main():
-    # 1. Fetch Data from Binance
+    # 1. Fetch Data
     df = fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01")
     
     # 2. Split Data
@@ -310,20 +328,22 @@ def main():
     # 3. Optimize (GA)
     optimizer = GeneticOptimizer(train_df)
     best_chrom = optimizer.evolve()
-    best_levels = optimizer.decode_chromosome(best_chrom)
+    best_levels, best_sl, best_tp = optimizer.decode_chromosome(best_chrom)
     
-    print(f"Optimization complete. Best configuration has {len(best_levels)} levels.")
+    print(f"Optimization complete.")
+    print(f"Best SL: {best_sl*100:.2f}%")
+    print(f"Best TP: {best_tp*100:.2f}%")
     
     # 4. Test on Out-of-Sample Data
     bt = Backtester(test_df)
-    equity, trades = bt.run(best_levels)
+    equity, trades = bt.run(best_levels, best_sl, best_tp)
     
     # 5. Generate Reports
     os.makedirs("output", exist_ok=True)
     
     plt.figure(figsize=(12, 6))
     plt.plot(equity, label='Equity Curve (Test Data)')
-    plt.title(f'Strategy Performance (Test Data)\nLevels: {len(best_levels)}')
+    plt.title(f'Strategy Performance (Test Data)\nLevels: {len(best_levels)} | SL: {best_sl*100:.2f}% | TP: {best_tp*100:.2f}%')
     plt.xlabel('Candles')
     plt.ylabel('Capital ($)')
     plt.legend()
@@ -350,7 +370,8 @@ def main():
             <li>Total Return: {total_return:.2f}%</li>
             <li>Total Trades: {len(trades)}</li>
             <li>Win Rate: {win_rate:.2f}%</li>
-            <li>Optimized Level Count: {len(best_levels)}</li>
+            <li>Optimized SL: {best_sl*100:.2f}%</li>
+            <li>Optimized TP: {best_tp*100:.2f}%</li>
         </ul>
         <hr>
         <h2>Equity Curve</h2>
