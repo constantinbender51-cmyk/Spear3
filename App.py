@@ -32,7 +32,7 @@ MAX_SL = 0.05    # 5.0%
 MIN_TP = 0.005   # 0.5%
 MAX_TP = 0.10    # 10.0%
 
-def fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01"):
+def fetch_binance_data(symbol="BTCUSDT", interval="30m", start_str="2025-01-01"):
     base_url = "https://api.binance.com/api/v3/klines"
     start_dt = datetime.strptime(start_str, "%Y-%m-%d")
     start_ts = int(start_dt.timestamp() * 1000)
@@ -43,6 +43,10 @@ def fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01"):
     
     print(f"Fetching {symbol} {interval} data from {start_str}...")
     
+    # Calculate ms per interval for pagination
+    interval_map = {"1m": 60000, "30m": 1800000, "1h": 3600000}
+    step_ms = interval_map.get(interval, 3600000)
+
     while True:
         params = {
             "symbol": symbol,
@@ -61,7 +65,7 @@ def fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01"):
                 
             all_data.extend(data)
             last_open_time = data[-1][0]
-            current_start = last_open_time + 3600000
+            current_start = last_open_time + step_ms
             
             last_date = datetime.fromtimestamp(last_open_time / 1000)
             print(f"Fetched up to {last_date}...", end='\r')
@@ -222,18 +226,32 @@ class GeneticOptimizer:
 
     def fitness(self, chrom):
         levels, sl, tp = self.decode_chromosome(chrom)
-        equity, _ = self.backtester.run(levels, sl, tp)
+        equity, trades = self.backtester.run(levels, sl, tp)
         
-        if len(equity) == 0 or equity[-1] == 10000.0:
-            return -1.0
-            
-        # Return total % return
-        ret = (equity[-1] - 10000.0) / 10000.0
-        return ret
+        # Penalize insufficient data points or bankruptcy
+        if len(trades) < 2 or equity[-1] <= 100.0:
+            return -10.0
+        
+        # Calculate Returns
+        equity_curve = np.array(equity)
+        # Avoid division by zero in returns calculation if equity is zero (already caught above, but safety first)
+        returns = np.diff(equity_curve) / equity_curve[:-1]
+        
+        std_dev = np.std(returns)
+        if std_dev < 1e-9:
+            return -10.0
+        
+        # Sharpe Ratio Calculation
+        # Annualization factor for 30m candles: 2 (per hour) * 24 * 365 = 17520
+        annualization_factor = np.sqrt(17520)
+        sharpe = (np.mean(returns) / std_dev) * annualization_factor
+        
+        return sharpe
 
     def evolve(self):
         print(f"Starting Optimization: {self.generations} Gens, Pop {self.pop_size}, Levels {NUM_LEVELS}")
-        print(f"Optimizing SL ({MIN_SL*100}%-{MAX_SL*100}%) and TP ({MIN_TP*100}%-{MAX_TP*100}%)")
+        print(f"Optimizing for Sharpe Ratio (30m timeframe)")
+        print(f"Ranges: SL ({MIN_SL*100}%-{MAX_SL*100}%) | TP ({MIN_TP*100}%-{MAX_TP*100}%)")
         
         for gen in range(self.generations):
             scores = []
@@ -242,11 +260,11 @@ class GeneticOptimizer:
             
             scores = np.array(scores)
             best_idx = np.argmax(scores)
-            best_ret = scores[best_idx]
+            best_sharpe = scores[best_idx]
             
             # Extract current best params for logging
             _, b_sl, b_tp = self.decode_chromosome(self.population[best_idx])
-            print(f"Gen {gen+1}/{self.generations} | Ret: {best_ret*100:.2f}% | SL: {b_sl*100:.2f}% | TP: {b_tp*100:.2f}%")
+            print(f"Gen {gen+1}/{self.generations} | Sharpe: {best_sharpe:.4f} | SL: {b_sl*100:.2f}% | TP: {b_tp*100:.2f}%")
             
             new_pop = np.zeros_like(self.population)
             # Elitism
@@ -316,7 +334,7 @@ def plot_candlesticks(df, levels, filename="ohlc.png"):
 
 def main():
     # 1. Fetch Data
-    df = fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01")
+    df = fetch_binance_data(symbol="BTCUSDT", interval="30m", start_str="2020-01-01")
     
     # 2. Split Data
     split_idx = int(len(df) * TRAIN_SPLIT)
