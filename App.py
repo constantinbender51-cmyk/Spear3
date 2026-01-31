@@ -11,7 +11,7 @@ from datetime import datetime
 import random
 
 # --- Configuration ---
-TRAIN_SPLIT = 0.70  # Modified to 70/30
+TRAIN_SPLIT = 0.70  # 70/30 Split
 PORT = 8080
 
 # Trading Costs (Fixed)
@@ -103,13 +103,13 @@ class Backtester:
         self.low = self.df['low'].values
         self.open = self.df['open'].values
         self.close = self.df['close'].values
-        self.sma = self.df['sma'].values  # Load SMA
+        self.sma = self.df['sma'].values
         self.n = len(df)
 
     def run(self, level_offsets, stop_loss, take_profit):
         """
         Executes the strategy with dynamic levels based on SMA offsets.
-        Direction: Breakout (Same direction as touch).
+        Direction: Reversal (Opposite direction of touch).
         """
         position = 0
         entry_price = 0.0
@@ -174,30 +174,28 @@ class Backtester:
             # --- Check Entry ---
             if position == 0:
                 # Calculate dynamic levels for current timestamp
-                # level = SMA * (1 + offset)
                 current_levels = current_sma * (1 + offsets)
                 
                 # Filter relevant levels strictly within high/low
-                # Optimization: Vector filtering
                 mask = (current_levels >= l) & (current_levels <= h)
                 
                 if np.any(mask):
                     relevant_levels = current_levels[mask]
                     for lvl in relevant_levels:
                         if prev_c < lvl <= h:
-                            # Cross UP -> LONG (Breakout)
-                            fill_price = lvl
-                            position = 1
-                            entry_price = fill_price * (1 + SLIPPAGE)
-                            current_equity = current_equity * (1 - FEE)
-                            break 
-                        
-                        elif prev_c > lvl >= l:
-                            # Cross DOWN -> SHORT (Breakdown)
+                            # Cross UP -> SHORT (Reversal: Betting on Resistance)
                             fill_price = lvl
                             position = -1
                             entry_price = fill_price * (1 - SLIPPAGE) 
                             current_equity = current_equity * (1 - FEE) 
+                            break 
+                        
+                        elif prev_c > lvl >= l:
+                            # Cross DOWN -> LONG (Reversal: Betting on Support)
+                            fill_price = lvl
+                            position = 1
+                            entry_price = fill_price * (1 + SLIPPAGE)
+                            current_equity = current_equity * (1 - FEE)
                             break 
             
             equity.append(current_equity)
@@ -211,10 +209,6 @@ class GeneticOptimizer:
         self.generations = generations
         self.backtester = Backtester(data_train)
         
-        # Chromosome Structure:
-        # 0: Stop Loss (Normalized)
-        # 1: Take Profit (Normalized)
-        # 2 to 51: Price Level Offsets (Normalized, Fixed Count 50)
         self.gene_length = 2 + NUM_LEVELS
         self.population = np.random.rand(pop_size, self.gene_length)
         
@@ -227,8 +221,7 @@ class GeneticOptimizer:
         tp_norm = chrom[1]
         take_profit = MIN_TP + tp_norm * (MAX_TP - MIN_TP)
         
-        # 3. Decode Level Offsets (Percentage from SMA)
-        # Maps 0..1 to MIN_OFFSET..MAX_OFFSET
+        # 3. Decode Level Offsets
         offsets_norm = chrom[2:]
         offsets = MIN_OFFSET + offsets_norm * (MAX_OFFSET - MIN_OFFSET)
         offsets.sort()
@@ -239,21 +232,17 @@ class GeneticOptimizer:
         offsets, sl, tp = self.decode_chromosome(chrom)
         equity, trades = self.backtester.run(offsets, sl, tp)
         
-        # Penalize insufficient data points or bankruptcy
         if len(trades) < 2 or equity[-1] <= 100.0:
             return -10.0
         
-        # Calculate Returns
         equity_curve = np.array(equity)
-        # Avoid division by zero in returns calculation if equity is zero (already caught above, but safety first)
         returns = np.diff(equity_curve) / equity_curve[:-1]
         
         std_dev = np.std(returns)
         if std_dev < 1e-9:
             return -10.0
         
-        # Sharpe Ratio Calculation
-        # Annualization factor for 1h candles: sqrt(24 * 365) = 93.59
+        # Sharpe Ratio (Annualized for 1h candles)
         annualization_factor = np.sqrt(24 * 365)
         sharpe = (np.mean(returns) / std_dev) * annualization_factor
         
@@ -261,7 +250,7 @@ class GeneticOptimizer:
 
     def evolve(self):
         print(f"Starting Optimization: {self.generations} Gens, Pop {self.pop_size}, Levels {NUM_LEVELS}")
-        print(f"Optimizing for Sharpe Ratio (1h timeframe)")
+        print(f"Optimizing for Sharpe Ratio (1h timeframe) - REVERSAL Strategy")
         print(f"Ranges: SL ({MIN_SL*100}%-{MAX_SL*100}%) | TP ({MIN_TP*100}%-{MAX_TP*100}%)")
         print(f"SMA Offsets: {MIN_OFFSET*100}% to {MAX_OFFSET*100}%")
         
@@ -274,16 +263,13 @@ class GeneticOptimizer:
             best_idx = np.argmax(scores)
             best_sharpe = scores[best_idx]
             
-            # Extract current best params for logging
             _, b_sl, b_tp = self.decode_chromosome(self.population[best_idx])
             print(f"Gen {gen+1}/{self.generations} | Sharpe: {best_sharpe:.4f} | SL: {b_sl*100:.2f}% | TP: {b_tp*100:.2f}%")
             
             new_pop = np.zeros_like(self.population)
-            # Elitism
             new_pop[0] = self.population[best_idx]
             
             for i in range(1, self.pop_size):
-                # Tournament Selection
                 cands = np.random.choice(self.pop_size, 3)
                 p1_idx = cands[np.argmax(scores[cands])]
                 cands = np.random.choice(self.pop_size, 3)
@@ -292,14 +278,12 @@ class GeneticOptimizer:
                 parent1 = self.population[p1_idx]
                 parent2 = self.population[p2_idx]
                 
-                # Crossover
                 if np.random.rand() < CROSSOVER_RATE:
                     cross_point = np.random.randint(1, self.gene_length)
                     child = np.concatenate((parent1[:cross_point], parent2[cross_point:]))
                 else:
                     child = parent1.copy()
                 
-                # Mutation
                 mutation_mask = np.random.rand(self.gene_length) < MUTATION_RATE
                 random_genes = np.random.rand(self.gene_length)
                 child[mutation_mask] = random_genes[mutation_mask]
@@ -332,7 +316,6 @@ def plot_candlesticks(df, filename="ohlc.png"):
     plt.bar(down.index, down.high - down.open, width2, bottom=down.open, color=down_color)
     plt.bar(down.index, down.low - down.close, width2, bottom=down.close, color=down_color)
 
-    # Plot SMA
     if 'sma' in df_plot.columns:
         plt.plot(df_plot.index, df_plot['sma'], color='blue', label='SMA 365', linewidth=1.5)
 
@@ -346,24 +329,19 @@ def plot_candlesticks(df, filename="ohlc.png"):
     plt.close()
 
 def main():
-    # 1. Fetch Data
     df = fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01")
     
-    # 2. Preprocess SMA
     print("Calculating SMA 365...")
     df['sma'] = df['close'].rolling(window=365).mean()
-    # Drop initial NaNs
     df.dropna(inplace=True)
     df.reset_index(drop=True, inplace=True)
     
-    # 3. Split Data
     split_idx = int(len(df) * TRAIN_SPLIT)
     train_df = df.iloc[:split_idx]
     test_df = df.iloc[split_idx:]
     
     print(f"Data prepared. Train size: {len(train_df)}, Test size: {len(test_df)}")
     
-    # 4. Optimize (GA)
     optimizer = GeneticOptimizer(train_df)
     best_chrom = optimizer.evolve()
     best_offsets, best_sl, best_tp = optimizer.decode_chromosome(best_chrom)
@@ -372,11 +350,9 @@ def main():
     print(f"Best SL: {best_sl*100:.2f}%")
     print(f"Best TP: {best_tp*100:.2f}%")
     
-    # 5. Test on Out-of-Sample Data
     bt = Backtester(test_df)
     equity, trades = bt.run(best_offsets, best_sl, best_tp)
     
-    # 6. Generate Reports
     os.makedirs("output", exist_ok=True)
     
     plt.figure(figsize=(12, 6))
@@ -399,7 +375,7 @@ def main():
     <html>
     <head><title>Trading Strategy Report</title></head>
     <body style="font-family: monospace; padding: 20px;">
-        <h1>Optimization Results</h1>
+        <h1>Optimization Results - Reversal Strategy</h1>
         <hr>
         <h2>Metrics (Test Set {100-TRAIN_SPLIT*100:.0f}%)</h2>
         <ul>
