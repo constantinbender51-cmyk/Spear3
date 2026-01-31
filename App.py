@@ -101,7 +101,7 @@ def fetch_binance_data(symbol, interval, years):
 
 # --- 2. QUARTER SPLITTING & UTILS ---
 def split_into_cycles(df):
-    groups = [g for n, g in df.groupby(pd.Grouper(freq='M'))]
+    groups = [g for n, g in df.groupby(pd.Grouper(freq='ME'))]
     cycles = []
     # Train: M1+M2, Gap: M3, Test: M4
     for i in range(0, len(groups) - 3, 4):
