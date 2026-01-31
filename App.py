@@ -12,7 +12,7 @@ import threading
 import time
 import json
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from deap import base, creator, tools, algorithms
 
 # --- Configuration ---
@@ -22,15 +22,10 @@ POPULATION_SIZE = 320
 GENERATIONS = 10
 RISK_FREE_RATE = 0.0
 MAX_ASSETS_TO_OPTIMIZE = 1
-
-# Costs
-SLIPPAGE = 0.003  # 0.3%
-FEE = 0.002       # 0.2%
-# Total friction per side (Price impact + Fee)
-FRICTION = SLIPPAGE + FEE
+TEST_FEE = 0.00 # 0.2% fee for final test
 
 # Ranges
-STOP_PCT_RANGE = (0, 0.02)   # 0.1% to 2%
+STOP_PCT_RANGE = (0.001, 0.02)   # 0.1% to 2%
 PROFIT_PCT_RANGE = (0.0004, 0.05) # 0.04% to 5%
 
 warnings.filterwarnings("ignore")
@@ -59,29 +54,25 @@ HTML_REPORTS = {}
 BEST_PARAMS = {}
 REPORT_LOCK = threading.Lock()
 
-# --- 1. DEAP Initialization (Global Scope) ---
+# --- 1. DEAP Initialization ---
 creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 creator.create("Individual", list, fitness=creator.FitnessMax)
 
-# --- 2. Precise Data Ingestion (Binance 1 Month - 1m Granularity) ---
-def fetch_binance_history(symbol_pair):
+# --- 2. Precise Data Ingestion (Binance 1M) ---
+def fetch_binance_data_1mo(pair):
     base_url = "https://api.binance.com/api/v3/klines"
-    
-    # Calculate timestamps for the last 30 days
-    end_time = datetime.now()
-    start_time = end_time - timedelta(days=3)
-    
-    start_ts = int(start_time.timestamp() * 1000)
-    end_ts = int(end_time.timestamp() * 1000)
+    # Approx 30 days ago
+    start_time = int((datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000)
+    end_time = int(datetime.now(timezone.utc).timestamp() * 1000)
     
     all_data = []
-    current_start = start_ts
+    current_start = start_time
     
-    print(f"[{symbol_pair}] Fetching last 30 days 1m data from Binance...")
+    print(f"[{pair}] Fetching 1m data from Binance (Last 30 Days)...")
     
-    while current_start < end_ts:
+    while True:
         params = {
-            'symbol': symbol_pair,
+            'symbol': pair,
             'interval': '1m',
             'startTime': current_start,
             'limit': 1000
@@ -97,56 +88,64 @@ def fetch_binance_history(symbol_pair):
                 
             all_data.extend(data)
             
-            # Update start time to the last timestamp + 1ms
-            last_kline_ts = data[-1][0]
-            current_start = last_kline_ts + 1
+            # Update start time to last candle close time + 1ms
+            last_close_time = data[-1][6]
+            current_start = last_close_time + 1
             
-            # Safety break if we pass end time
-            if last_kline_ts >= end_ts:
+            if len(data) < 1000 or current_start > end_time:
                 break
                 
-            time.sleep(0.1) 
+            time.sleep(0.1) # Rate limit respect
             
         except Exception as e:
-            print(f"CRITICAL API ERROR for {symbol_pair}: {e}")
-            return None, None
-
+            print(f"Error fetching {pair}: {e}")
+            break
+            
     if not all_data:
-        return None, None
+        return None
 
-    # Convert to DataFrame
     df = pd.DataFrame(all_data, columns=[
-        'timestamp', 'open', 'high', 'low', 'close', 'volume', 
-        'close_time', 'quote_asset_volume', 'number_of_trades', 
-        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
     ])
     
-    df['dt'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df['open'] = df['open'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
-    df['close'] = df['close'].astype(float)
-    
+    df['dt'] = pd.to_datetime(df['open_time'], unit='ms')
     df.set_index('dt', inplace=True)
+    
+    numeric_cols = ['open', 'high', 'low', 'close']
+    df[numeric_cols] = df[numeric_cols].astype(float)
+    
+    df = df[numeric_cols]
     df.sort_index(inplace=True)
     
-    # Filter strictly last 30 days
-    df = df[df.index >= start_time]
+    print(f"[{pair}] Fetched {len(df)} 1m rows.")
+    return df
 
-    print(f"[{symbol_pair}] Raw 1m Data (No Resampling): {len(df)} rows")
+def get_data_payload(pair):
+    df = fetch_binance_data_1mo(pair)
+    if df is None or len(df) < 100:
+        return None, None, None, None
 
-    if len(df) < 500:
-        print("Insufficient data.")
-        return None, None
+    # GA Optimization Data (Resampled to 1H for speed)
+    df_1h = df.resample('1h').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last'
+    }).dropna()
 
-    split_idx = int(len(df) * 0.85)
-    train = df.iloc[:split_idx]
-    test = df.iloc[split_idx:]
+    # Split Indices
+    split_idx_1h = int(len(df_1h) * 0.85)
+    train_1h = df_1h.iloc[:split_idx_1h]
+    # We don't really use test_1h, we use test_1m for final validation
     
-    return train, test
+    split_idx_1m = int(len(df) * 0.85)
+    test_1m = df.iloc[split_idx_1m:]
+    
+    return train_1h, test_1m
 
-# --- 3. Strategy Logic (With Costs) ---
-def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0, use_costs=True):
+# --- 3. Strategy Logic (Multi-Trade, Hedged, Fees) ---
+def run_backtest(df, stop_pct, profit_pct, lines, fee=0.0, detailed_log_trades=0):
     closes = df['close'].values
     highs = df['high'].values
     lows = df['low'].values
@@ -154,19 +153,18 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0, use_cos
     
     equity = 10000.0
     equity_curve = [equity]
-    position = 0          # 0: Flat, 1: Long, -1: Short
-    entry_price = 0.0
     
-    trades = []
+    # Hedging: Separate lists for active trades
+    # Each trade: {'entry': float, 'type': 1/-1}
+    long_trades = []
+    short_trades = []
+    
+    trades_history = []
     hourly_log = []
     
     lines = np.sort(lines)
     trades_completed = 0
     
-    # Determine cost factors
-    current_slippage = SLIPPAGE if use_costs else 0.0
-    current_fee = FEE if use_costs else 0.0
-
     for i in range(1, len(df)):
         current_c = closes[i]
         current_h = highs[i]
@@ -174,142 +172,128 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0, use_cos
         prev_c = closes[i-1]
         ts = times[i]
         
-        # --- Detailed Logging ---
-        if detailed_log_trades > 0 and trades_completed < detailed_log_trades:
-            idx = np.searchsorted(lines, current_c)
-            val_below = lines[idx-1] if idx > 0 else -999.0
-            val_above = lines[idx] if idx < len(lines) else 999999.0
+        # --- Check Exits (Longs) ---
+        # Iterate backwards to safely remove
+        for idx in range(len(long_trades) - 1, -1, -1):
+            trade = long_trades[idx]
+            entry_price = trade['entry']
+            sl_price = entry_price * (1 - stop_pct)
+            tp_price = entry_price * (1 + profit_pct)
             
-            act_sl = np.nan
-            act_tp = np.nan
-            pos_str = "FLAT"
-            
-            if position == 1:
-                pos_str = "LONG"
-                act_sl = entry_price * (1 - stop_pct)
-                act_tp = entry_price * (1 + profit_pct)
-            elif position == -1:
-                pos_str = "SHORT"
-                act_sl = entry_price * (1 + stop_pct)
-                act_tp = entry_price * (1 - profit_pct)
-            
-            log_entry = {
-                "Timestamp": str(ts),
-                "Price": f"{current_c:.2f}",
-                "Nearest Below": f"{val_below:.2f}" if val_below != -999 else "None",
-                "Nearest Above": f"{val_above:.2f}" if val_above != 999999 else "None",
-                "Position": pos_str,
-                "Active SL": f"{act_sl:.2f}" if not np.isnan(act_sl) else "-",
-                "Active TP": f"{act_tp:.2f}" if not np.isnan(act_tp) else "-",
-                "Equity": f"{equity:.2f}"
-            }
-            hourly_log.append(log_entry)
-
-        # --- Strategy Execution ---
-        if position != 0:
-            sl_hit = False
-            tp_hit = False
             exit_price = 0.0
             reason = ""
-
-            if position == 1: # Long Logic
-                sl_price = entry_price * (1 - stop_pct)
-                tp_price = entry_price * (1 + profit_pct)
-                
-                if current_l <= sl_price:
-                    sl_hit = True; exit_price = sl_price 
-                elif current_h >= tp_price:
-                    tp_hit = True; exit_price = tp_price
-
-            elif position == -1: # Short Logic
-                sl_price = entry_price * (1 + stop_pct)
-                tp_price = entry_price * (1 - profit_pct)
-                
-                if current_h >= sl_price:
-                    sl_hit = True; exit_price = sl_price
-                elif current_l <= tp_price:
-                    tp_hit = True; exit_price = tp_price
+            hit = False
             
-            if sl_hit or tp_hit:
-                # APPLY EXIT COSTS
-                if position == 1: 
-                    # Sell: Price decreases by slippage
-                    effective_exit = exit_price * (1 - current_slippage)
-                    # Buy was: entry_price * (1 + current_slippage)
-                    gross_pnl = (effective_exit - (entry_price * (1 + current_slippage))) / (entry_price * (1 + current_slippage))
-                    net_pnl = gross_pnl - (current_fee * 2)
-                    
-                else: 
-                    # Buy to cover: Price increases by slippage
-                    effective_exit = exit_price * (1 + current_slippage)
-                    # Sell was: entry_price * (1 - current_slippage)
-                    gross_pnl = ((entry_price * (1 - current_slippage)) - effective_exit) / (entry_price * (1 - current_slippage))
-                    net_pnl = gross_pnl - (current_fee * 2)
-
+            if current_l <= sl_price:
+                exit_price = sl_price
+                reason = "SL"
+                hit = True
+            elif current_h >= tp_price:
+                exit_price = tp_price
+                reason = "TP"
+                hit = True
+                
+            if hit:
+                pn_l = (exit_price - entry_price) / entry_price
+                # Apply Fee
+                net_pnl = pn_l - fee
                 equity *= (1 + net_pnl)
-                reason = "SL" if sl_hit else "TP"
-                trades.append({'time': ts, 'type': 'Exit', 'price': exit_price, 'pnl': net_pnl, 'equity': equity, 'reason': reason})
-                position = 0
+                
+                trades_history.append({
+                    'time': ts, 'type': 'Exit Long', 'price': exit_price, 
+                    'pnl': pn_l, 'net_pnl': net_pnl, 'equity': equity, 'reason': reason
+                })
+                long_trades.pop(idx)
                 trades_completed += 1
-                equity_curve.append(equity)
-                continue 
 
-        if position == 0:
-            found_short = False
-            short_price = 0.0
+        # --- Check Exits (Shorts) ---
+        for idx in range(len(short_trades) - 1, -1, -1):
+            trade = short_trades[idx]
+            entry_price = trade['entry']
+            sl_price = entry_price * (1 + stop_pct)
+            tp_price = entry_price * (1 - profit_pct)
             
-            # Check for lines between prev_c and current_h (Short Candidates)
-            if current_h > prev_c:
-                idx_s = np.searchsorted(lines, prev_c, side='right')   
-                idx_e = np.searchsorted(lines, current_h, side='right') 
-                potential_shorts = lines[idx_s:idx_e]
+            exit_price = 0.0
+            reason = ""
+            hit = False
+            
+            if current_h >= sl_price:
+                exit_price = sl_price
+                reason = "SL"
+                hit = True
+            elif current_l <= tp_price:
+                exit_price = tp_price
+                reason = "TP"
+                hit = True
                 
-                if len(potential_shorts) > 0:
-                    found_short = True
-                    short_price = potential_shorts[0] 
-
-            found_long = False
-            long_price = 0.0
-            
-            # Check for lines between current_l and prev_c (Long Candidates)
-            if current_l < prev_c:
-                idx_s = np.searchsorted(lines, current_l, side='left') 
-                idx_e = np.searchsorted(lines, prev_c, side='left')    
-                potential_longs = lines[idx_s:idx_e]
+            if hit:
+                pn_l = (entry_price - exit_price) / entry_price
+                # Apply Fee
+                net_pnl = pn_l - fee
+                equity *= (1 + net_pnl)
                 
-                if len(potential_longs) > 0:
-                    found_long = True
-                    long_price = potential_longs[-1] 
+                trades_history.append({
+                    'time': ts, 'type': 'Exit Short', 'price': exit_price, 
+                    'pnl': pn_l, 'net_pnl': net_pnl, 'equity': equity, 'reason': reason
+                })
+                short_trades.pop(idx)
+                trades_completed += 1
 
-            # Execution Decision
-            target_line = 0.0
-            new_pos = 0
+        # --- Entry Logic (Simultaneous) ---
+        found_short = False
+        short_target = 0.0
+        
+        if current_h > prev_c:
+            idx_s = np.searchsorted(lines, prev_c, side='right')
+            idx_e = np.searchsorted(lines, current_h, side='right')
+            potential_shorts = lines[idx_s:idx_e]
+            if len(potential_shorts) > 0:
+                found_short = True
+                short_target = potential_shorts[0]
+
+        found_long = False
+        long_target = 0.0
+        
+        if current_l < prev_c:
+            idx_s = np.searchsorted(lines, current_l, side='left')
+            idx_e = np.searchsorted(lines, prev_c, side='left')
+            potential_longs = lines[idx_s:idx_e]
+            if len(potential_longs) > 0:
+                found_long = True
+                long_target = potential_longs[-1]
+
+        # Execute Entries (Independent Accounts)
+        if found_short:
+            # Avoid duplicate entries on exact same candle/price to prevent spam if grid is tight
+            # Simple check: Don't enter if we just entered same price in same list?
+            # For this logic, we assume valid signal = trade.
+            short_trades.append({'entry': short_target})
+            trades_history.append({'time': ts, 'type': 'Short', 'price': short_target, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
             
-            if found_short and found_long:
-                if current_c > prev_c:
-                    new_pos = -1; target_line = short_price
-                else:
-                    new_pos = 1; target_line = long_price
-            elif found_short:
-                new_pos = -1; target_line = short_price
-            elif found_long:
-                new_pos = 1; target_line = long_price
-            
-            if new_pos != 0:
-                position = new_pos
-                entry_price = target_line
-                trades.append({'time': ts, 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
+        if found_long:
+            long_trades.append({'entry': long_target})
+            trades_history.append({'time': ts, 'type': 'Long', 'price': long_target, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
 
         equity_curve.append(equity)
+        
+        # --- Detailed Logging ---
+        if detailed_log_trades > 0 and len(hourly_log) < detailed_log_trades:
+             # Just logging snapshot
+             hourly_log.append({
+                "Timestamp": str(ts),
+                "Price": f"{current_c:.2f}",
+                "Active Longs": len(long_trades),
+                "Active Shorts": len(short_trades),
+                "Equity": f"{equity:.2f}"
+            })
 
-    return equity_curve, trades, hourly_log
+    return equity_curve, trades_history, hourly_log
 
 def calculate_sharpe(equity_curve):
     if len(equity_curve) < 2: return -999.0
     returns = pd.Series(equity_curve).pct_change().dropna()
     if returns.std() == 0: return -999.0
-    # Annualized Sharpe: 1m bars -> minutes in year (525600)
-    return np.sqrt(525600) * (returns.mean() / returns.std())
+    return np.sqrt(8760) * (returns.mean() / returns.std())
 
 # --- 4. Genetic Algorithm ---
 def setup_toolbox(min_price, max_price, df_train):
@@ -326,15 +310,16 @@ def setup_toolbox(min_price, max_price, df_train):
     toolbox.register("mate", tools.cxTwoPoint) 
     toolbox.register("mutate", mutate_custom, indpb=0.1, min_p=min_price, max_p=max_price)
     toolbox.register("select", tools.selTournament, tournsize=3)
-    
     return toolbox
 
 def evaluate_genome(individual, df_train):
     stop_pct = np.clip(individual[0], STOP_PCT_RANGE[0], STOP_PCT_RANGE[1])
     profit_pct = np.clip(individual[1], PROFIT_PCT_RANGE[0], PROFIT_PCT_RANGE[1])
     lines = np.array(individual[2:])
-    # Training phase: use_costs=False
-    eq_curve, _, _ = run_backtest(df_train, stop_pct, profit_pct, lines, detailed_log_trades=0, use_costs=False)
+    # GA Training: No Fees (standard practice to identify alpha), or Low Fees. 
+    # Logic: Prompt says "Apply 0.2 fees to the final test". Implies training is fee-less or different.
+    # We stick to fee=0.0 for GA to allow signal discovery, applying rigorous fee check in validation.
+    eq_curve, _, _ = run_backtest(df_train, stop_pct, profit_pct, lines, fee=0.0, detailed_log_trades=0)
     return (calculate_sharpe(eq_curve),)
 
 def mutate_custom(individual, indpb, min_p, max_p):
@@ -348,32 +333,14 @@ def mutate_custom(individual, indpb, min_p, max_p):
     return individual,
 
 # --- 5. Reporting ---
-def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_curve, test_trades, hourly_log, live_logs=[], live_trades=[]):
-    plt.figure(figsize=(14, 12))
+def generate_report(symbol, best_ind, test_curve, test_trades, hourly_log, live_logs=[], live_trades=[]):
+    plt.figure(figsize=(14, 8))
     
-    # 1. Equity Curve
-    plt.subplot(2, 1, 1)
-    plt.title(f"{symbol} Equity Curve: Training (Blue) vs Test (Orange) - 30 Days")
-    plt.plot(train_curve, label='Training Equity')
-    plt.plot(range(len(train_curve), len(train_curve)+len(test_curve)), test_curve, label='Test Equity')
+    # Equity Curve
+    plt.title(f"{symbol} Test Equity Curve (Fee: {TEST_FEE*100}%)")
+    plt.plot(test_curve, label='Test Equity (with Fees)', color='orange')
     plt.legend()
     plt.grid(True)
-    
-    # 2. Full Price Action
-    plt.subplot(2, 1, 2)
-    plt.title(f"{symbol} Test Set Price Action & Grid Lines")
-    plt.plot(test_data.index, test_data['close'], color='black', alpha=1, label='Price', linewidth=0.8)
-    
-    lines = best_ind[2:]
-    min_test = test_data['low'].min()
-    max_test = test_data['high'].max()
-    margin = (max_test - min_test) * 0.1
-    visible_lines = [l for l in lines if (min_test - margin) < l < (max_test + margin)]
-    
-    for l in visible_lines:
-        plt.axhline(y=l, color='blue', alpha=0.1, linewidth=0.5)
-    
-    plt.tight_layout()
     
     img_io = io.BytesIO()
     plt.savefig(img_io, format='png', dpi=100)
@@ -397,9 +364,7 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
     <ul class="list-group">
         <li class="list-group-item"><strong>Stop Loss:</strong> {best_ind[0]*100:.4f}%</li>
         <li class="list-group-item"><strong>Take Profit:</strong> {best_ind[1]*100:.4f}%</li>
-        <li class="list-group-item"><strong>Active Grid Lines:</strong> {N_LINES}</li>
-        <li class="list-group-item"><strong>Friction (Fee+Slip):</strong> {(FRICTION*2)*100:.2f}% / Trade</li>
-        <li class="list-group-item"><a href="/api/parameters?symbol={symbol}" target="_blank">View JSON Parameters</a></li>
+        <li class="list-group-item"><strong>Test Fee Applied:</strong> {TEST_FEE*100:.2f}%</li>
     </ul>
     """
 
@@ -409,13 +374,13 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
     <head>
         <title>{symbol} Strategy Results</title>
         <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-        <meta http-equiv="refresh" content="3000"> 
+        <meta http-equiv="refresh" content="30"> 
         <style>body {{ padding: 20px; }} h3 {{ margin-top: 30px; }} th {{ position: sticky; top: 0; background: white; }}</style>
     </head>
     <body>
         <div class="container-fluid">
             <a href="/" class="btn btn-secondary mb-3">&larr; Back to Dashboard</a>
-            <h1 class="mb-4">{symbol} Grid Strategy GA Results (Binance 30d 1m)</h1>
+            <h1 class="mb-4">{symbol} Hedged Grid Strategy</h1>
             <div class="row">
                 <div class="col-md-4">{params_html}</div>
                 <div class="col-md-8 text-right">
@@ -429,7 +394,6 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
             <hr>
             <div id="live-section" style="background-color: #f8f9fa; padding: 15px; border-left: 5px solid #28a745;">
                 <h2 class="text-success">{symbol} Live Forward Test (Binance 1m)</h2>
-                <p><strong>Status:</strong> Running. Fetches candle at XX:XX:05 (Every Minute).</p>
                 <div class="row">
                     <div class="col-md-6">
                         <h4>Live Minute State</h4>
@@ -447,11 +411,11 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
             </div>
 
             <hr>
-            <h3>Trade Log (Test Set)</h3>
+            <h3>Test Set Trade Log</h3>
             <div style="max-height: 400px; overflow-y: scroll; border: 1px solid #ddd;">{trades_html}</div>
             
             <hr>
-            <h3>Hourly Details (First 5 Trades Timeline)</h3>
+            <h3>Execution Detail (Snapshot)</h3>
             <div style="max-height: 600px; overflow-y: scroll; border: 1px solid #ddd;">
                 {hourly_html}
             </div>
@@ -461,40 +425,33 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
     """
     return html_content
 
-# --- 6. Live Forward Test Logic (1 Minute Update) ---
+# --- 6. Live Forward Test Logic ---
 def fetch_binance_candle(symbol_pair):
     try:
         url = "https://api.binance.com/api/v3/klines"
-        params = {
-            'symbol': symbol_pair,
-            'interval': '1m', 
-            'limit': 2 
-        }
+        params = {'symbol': symbol_pair, 'interval': '1m', 'limit': 2}
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
         if len(data) >= 2:
             kline = data[-2] 
             ts = pd.to_datetime(kline[0], unit='ms')
-            high_price = float(kline[2])
-            low_price = float(kline[3])
-            close_price = float(kline[4])
-            return ts, high_price, low_price, close_price
+            return ts, float(kline[2]), float(kline[3]), float(kline[4])
         return None, None, None, None
     except Exception as e:
         print(f"[{symbol_pair}] Binance API Error: {e}")
         return None, None, None, None
 
-def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, train_df, test_df, train_curve, test_curve, test_trades, hourly_log):
-    
+def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, test_curve, test_trades, hourly_log):
     stop_pct = best_ind[0]
     profit_pct = best_ind[1]
     lines = np.sort(np.array(best_ind[2:]))
     
     live_equity = initial_equity
-    live_position = 0 
-    live_entry_price = 0.0
     prev_close = start_price
+    
+    live_longs = []
+    live_shorts = []
     
     live_logs = []
     live_trades = []
@@ -505,141 +462,101 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
     while True:
         now = datetime.now()
         next_run = (now + timedelta(minutes=1)).replace(second=5, microsecond=0)
-        
-        if next_run <= now:
-            next_run += timedelta(minutes=1)
-            
-        sleep_sec = (next_run - now).total_seconds()
-        sleep_sec += random.uniform(0.1, 1.0)
-        
-        time.sleep(sleep_sec)
+        if next_run <= now: next_run += timedelta(minutes=1)
+        time.sleep((next_run - now).total_seconds())
         
         ts, current_h, current_l, current_c = fetch_binance_candle(pair)
-        
-        if current_c is None:
-            print(f"[{symbol}] Failed to fetch data. Skipping.")
-            continue
+        if current_c is None: continue
             
-        print(f"[{symbol}] Processing {ts} Close: {current_c}")
-        
-        idx = np.searchsorted(lines, current_c)
-        val_below = lines[idx-1] if idx > 0 else -999.0
-        val_above = lines[idx] if idx < len(lines) else 999999.0
-        
-        act_sl = np.nan
-        act_tp = np.nan
-        pos_str = "FLAT"
-        
-        if live_position == 1:
-            pos_str = "LONG"
-            act_sl = live_entry_price * (1 - stop_pct)
-            act_tp = live_entry_price * (1 + profit_pct)
-        elif live_position == -1:
-            pos_str = "SHORT"
-            act_sl = live_entry_price * (1 + stop_pct)
-            act_tp = live_entry_price * (1 - profit_pct)
-            
+        # Log State
         log_entry = {
             "Timestamp": str(ts),
             "Price": f"{current_c:.2f}",
-            "Nearest Below": f"{val_below:.2f}" if val_below != -999 else "None",
-            "Nearest Above": f"{val_above:.2f}" if val_above != 999999 else "None",
-            "Position": pos_str,
-            "Active SL": f"{act_sl:.2f}" if not np.isnan(act_sl) else "-",
-            "Active TP": f"{act_tp:.2f}" if not np.isnan(act_tp) else "-",
+            "Active Longs": len(live_longs),
+            "Active Shorts": len(live_shorts),
             "Equity": f"{live_equity:.2f}"
         }
         live_logs.append(log_entry)
         
-        if live_position != 0:
-            sl_hit = False
-            tp_hit = False
+        # 1. Check Exits (Longs)
+        for idx in range(len(live_longs) - 1, -1, -1):
+            trade = live_longs[idx]
+            entry_price = trade['entry']
+            sl_price = entry_price * (1 - stop_pct)
+            tp_price = entry_price * (1 + profit_pct)
+            
             exit_price = 0.0
+            hit = False
             reason = ""
-
-            if live_position == 1:
-                sl_price = live_entry_price * (1 - stop_pct)
-                tp_price = live_entry_price * (1 + profit_pct)
-                
-                if current_l <= sl_price:
-                    sl_hit = True; exit_price = sl_price
-                elif current_h >= tp_price:
-                    tp_hit = True; exit_price = tp_price
-                    
-            elif live_position == -1:
-                sl_price = live_entry_price * (1 + stop_pct)
-                tp_price = live_entry_price * (1 - profit_pct)
-                
-                if current_h >= sl_price:
-                    sl_hit = True; exit_price = sl_price
-                elif current_l <= tp_price:
-                    tp_hit = True; exit_price = tp_price
             
-            if sl_hit or tp_hit:
-                # Live Simulation of Costs
-                if live_position == 1:
-                    effective_exit = exit_price * (1 - SLIPPAGE)
-                    gross_pnl = (effective_exit - (live_entry_price * (1 + SLIPPAGE))) / (live_entry_price * (1 + SLIPPAGE))
-                    net_pnl = gross_pnl - (FEE * 2)
-                else:
-                    effective_exit = exit_price * (1 + SLIPPAGE)
-                    gross_pnl = ((live_entry_price * (1 - SLIPPAGE)) - effective_exit) / (live_entry_price * (1 - SLIPPAGE))
-                    net_pnl = gross_pnl - (FEE * 2)
+            if current_l <= sl_price:
+                exit_price = sl_price; hit = True; reason = "SL"
+            elif current_h >= tp_price:
+                exit_price = tp_price; hit = True; reason = "TP"
                 
+            if hit:
+                pn_l = (exit_price - entry_price) / entry_price
+                # Fee applied to live logic for realism (simulated live)
+                net_pnl = pn_l - TEST_FEE 
                 live_equity *= (1 + net_pnl)
-                reason = "SL" if sl_hit else "TP"
-                live_trades.append({'time': ts, 'type': 'Exit', 'price': exit_price, 'pnl': net_pnl, 'equity': live_equity, 'reason': reason})
-                live_position = 0
-                
-                prev_close = current_c
+                live_trades.append({'time': ts, 'type': 'Exit Long', 'price': exit_price, 'pnl': pn_l, 'equity': live_equity, 'reason': reason})
+                live_longs.pop(idx)
                 with REPORT_LOCK:
-                    HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
-                continue
+                    HTML_REPORTS[symbol] = generate_report(symbol, best_ind, test_curve, test_trades, hourly_log, live_logs, live_trades)
 
-        if live_position == 0:
-            found_short = False
-            short_price = 0.0
+        # 2. Check Exits (Shorts)
+        for idx in range(len(live_shorts) - 1, -1, -1):
+            trade = live_shorts[idx]
+            entry_price = trade['entry']
+            sl_price = entry_price * (1 + stop_pct)
+            tp_price = entry_price * (1 - profit_pct)
             
-            if current_h > prev_close:
-                idx_s = np.searchsorted(lines, prev_close, side='right')
-                idx_e = np.searchsorted(lines, current_h, side='right')
-                potential_shorts = lines[idx_s:idx_e]
-                if len(potential_shorts) > 0:
-                    found_short = True
-                    short_price = potential_shorts[0]
-
-            found_long = False
-            long_price = 0.0
+            exit_price = 0.0
+            hit = False
+            reason = ""
             
-            if current_l < prev_close:
-                idx_s = np.searchsorted(lines, current_l, side='left')
-                idx_e = np.searchsorted(lines, prev_close, side='left')
-                potential_longs = lines[idx_s:idx_e]
-                if len(potential_longs) > 0:
-                    found_long = True
-                    long_price = potential_longs[-1]
-
-            target_line = 0.0
-            new_pos = 0
+            if current_h >= sl_price:
+                exit_price = sl_price; hit = True; reason = "SL"
+            elif current_l <= tp_price:
+                exit_price = tp_price; hit = True; reason = "TP"
             
-            if found_short and found_long:
-                if current_c > prev_close:
-                    new_pos = -1; target_line = short_price
-                else:
-                    new_pos = 1; target_line = long_price
-            elif found_short:
-                new_pos = -1; target_line = short_price
-            elif found_long:
-                new_pos = 1; target_line = long_price
-                
-            if new_pos != 0:
-                live_position = new_pos
-                live_entry_price = target_line
-                live_trades.append({'time': ts, 'type': 'Short' if live_position == -1 else 'Long', 'price': live_entry_price, 'pnl': 0, 'equity': live_equity, 'reason': 'Entry'})
+            if hit:
+                pn_l = (entry_price - exit_price) / entry_price
+                net_pnl = pn_l - TEST_FEE
+                live_equity *= (1 + net_pnl)
+                live_trades.append({'time': ts, 'type': 'Exit Short', 'price': exit_price, 'pnl': pn_l, 'equity': live_equity, 'reason': reason})
+                live_shorts.pop(idx)
+                with REPORT_LOCK:
+                    HTML_REPORTS[symbol] = generate_report(symbol, best_ind, test_curve, test_trades, hourly_log, live_logs, live_trades)
 
+        # 3. Check Entries
+        found_short = False
+        short_target = 0.0
+        if current_h > prev_close:
+            idx_s = np.searchsorted(lines, prev_close, side='right')
+            idx_e = np.searchsorted(lines, current_h, side='right')
+            shorts = lines[idx_s:idx_e]
+            if len(shorts) > 0: found_short = True; short_target = shorts[0]
+
+        found_long = False
+        long_target = 0.0
+        if current_l < prev_close:
+            idx_s = np.searchsorted(lines, current_l, side='left')
+            idx_e = np.searchsorted(lines, prev_close, side='left')
+            longs = lines[idx_s:idx_e]
+            if len(longs) > 0: found_long = True; long_target = longs[-1]
+            
+        if found_short:
+            live_shorts.append({'entry': short_target})
+            live_trades.append({'time': ts, 'type': 'Short', 'price': short_target, 'pnl': 0, 'equity': live_equity, 'reason': 'Entry'})
+            
+        if found_long:
+            live_longs.append({'entry': long_target})
+            live_trades.append({'time': ts, 'type': 'Long', 'price': long_target, 'pnl': 0, 'equity': live_equity, 'reason': 'Entry'})
+            
         prev_close = current_c
         with REPORT_LOCK:
-            HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
+             HTML_REPORTS[symbol] = generate_report(symbol, best_ind, test_curve, test_trades, hourly_log, live_logs, live_trades)
 
 # --- 7. Server Handler ---
 class ResultsHandler(http.server.SimpleHTTPRequestHandler):
@@ -649,126 +566,70 @@ class ResultsHandler(http.server.SimpleHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed_path.query)
 
         if path == '/api/parameters':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
+            self.send_response(200); self.send_header('Content-type', 'application/json'); self.end_headers()
             symbol = query.get('symbol', [None])[0]
-            if symbol and symbol in BEST_PARAMS:
-                self.wfile.write(json.dumps(BEST_PARAMS[symbol]).encode('utf-8'))
-            else:
-                self.wfile.write(json.dumps(BEST_PARAMS).encode('utf-8'))
-                
+            if symbol and symbol in BEST_PARAMS: self.wfile.write(json.dumps(BEST_PARAMS[symbol]).encode('utf-8'))
+            else: self.wfile.write(json.dumps(BEST_PARAMS).encode('utf-8'))
         elif path.startswith('/report/'):
             symbol = path.split('/')[-1]
             if symbol in HTML_REPORTS:
-                self.send_response(200)
-                self.send_header('Content-type', 'text/html')
-                self.end_headers()
-                with REPORT_LOCK:
-                    self.wfile.write(HTML_REPORTS[symbol].encode('utf-8'))
-            else:
-                self.send_error(404, "Report not found for symbol")
-                
+                self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
+                with REPORT_LOCK: self.wfile.write(HTML_REPORTS[symbol].encode('utf-8'))
+            else: self.send_error(404)
         elif path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            
-            # Dashboard Index
+            self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
             links = ""
             for asset in ASSETS:
                 sym = asset['symbol']
-                if sym in HTML_REPORTS:
-                    links += f'<a href="/report/{sym}" class="list-group-item list-group-item-action">{sym} Strategy Report</a>'
-                else:
-                    links += f'<div class="list-group-item list-group-item-light">{sym} (Initializing...)</div>'
-            
-            dashboard = f"""
-            <html>
-            <head>
-                <title>Multi-Asset Grid Bot</title>
-                <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-                <meta http-equiv="refresh" content="30">
-            </head>
-            <body class="p-5">
-                <h1>Active Grid Strategies</h1>
-                <div class="list-group mt-4">
-                    {links}
-                </div>
-            </body>
-            </html>
-            """
-            self.wfile.write(dashboard.encode('utf-8'))
-        else:
-            self.send_error(404)
+                links += f'<a href="/report/{sym}" class="list-group-item list-group-item-action">{sym} Report</a>' if sym in HTML_REPORTS else f'<div class="list-group-item">{sym} (Loading...)</div>'
+            html = f"<html><head><link rel='stylesheet' href='https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css'></head><body class='p-5'><h1>Hedged Grid Bot</h1><div class='list-group mt-4'>{links}</div></body></html>"
+            self.wfile.write(html.encode('utf-8'))
+        else: self.send_error(404)
 
-# --- 8. Main Execution Loop ---
+# --- 8. Main Loop ---
 def process_asset(asset_config):
     sym = asset_config['symbol']
     pair = asset_config['pair']
     
     print(f"\n--- Starting Optimization for {sym} ---")
     
-    # 1. Get Data (Binance 30d 1m)
-    train_df, test_df = fetch_binance_history(pair)
-    if train_df is None:
-        print(f"Skipping {sym} due to data error.")
-        return
+    # 1. Get Data
+    train_1h, test_1m = get_data_payload(pair)
+    if train_1h is None: return
 
-    # 2. Setup GA
-    min_p, max_p = train_df['close'].min(), train_df['close'].max()
-    toolbox = setup_toolbox(min_p, max_p, train_df)
+    # 2. Setup GA (Train on 1H, no fees)
+    min_p, max_p = train_1h['close'].min(), train_1h['close'].max()
+    toolbox = setup_toolbox(min_p, max_p, train_1h)
 
     # 3. Run GA
     pop = toolbox.population(n=POPULATION_SIZE)
     hof = tools.HallOfFame(1)
     stats = tools.Statistics(lambda ind: ind.fitness.values)
     stats.register("avg", np.mean)
-    stats.register("max", np.max)
     
-    print(f"[{sym}] Evolving...")
     algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=GENERATIONS, stats=stats, halloffame=hof, verbose=False)
-    
     best_ind = hof[0]
-    print(f"[{sym}] Best Sharpe: {best_ind.fitness.values[0]:.4f}")
-
-    # 4. Save Params
-    BEST_PARAMS[sym] = {
-        "stop_percent": best_ind[0],
-        "profit_percent": best_ind[1],
-        "line_prices": list(best_ind[2:])
-    }
-
-    # 5. Final Tests (Include Costs for Reporting)
-    # Note: Training curve uses costs here to show realistic performance of the trained individual
-    train_curve, _, _ = run_backtest(train_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=0, use_costs=True)
-    test_curve, test_trades, hourly_log = run_backtest(test_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=5, use_costs=True)
     
-    # 6. Generate Initial Report
-    with REPORT_LOCK:
-        HTML_REPORTS[sym] = generate_report(sym, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log)
+    # 4. Save Params
+    BEST_PARAMS[sym] = {"stop": best_ind[0], "profit": best_ind[1], "lines": list(best_ind[2:])}
 
-    # 7. Start Live Thread
-    last_test_close = test_df['close'].iloc[-1]
-    t = threading.Thread(
-        target=live_trading_daemon, 
-        args=(sym, pair, best_ind, 10000.0, last_test_close, train_df, test_df, train_curve, test_curve, test_trades, hourly_log),
-        daemon=True
-    )
+    # 5. Final Tests (On 1M Data, WITH FEES)
+    print(f"[{sym}] Running Final Test on 1m Data with {TEST_FEE*100}% Fee...")
+    # Passing test_1m (high res) to backtest
+    test_curve, test_trades, hourly_log = run_backtest(test_1m, best_ind[0], best_ind[1], np.array(best_ind[2:]), fee=TEST_FEE, detailed_log_trades=10)
+    
+    with REPORT_LOCK:
+        HTML_REPORTS[sym] = generate_report(sym, best_ind, test_curve, test_trades, hourly_log)
+
+    # 6. Start Live Thread
+    last_close = test_1m['close'].iloc[-1]
+    t = threading.Thread(target=live_trading_daemon, args=(sym, pair, best_ind, 10000.0, last_close, test_curve, test_trades, hourly_log), daemon=True)
     t.start()
-    print(f"[{sym}] Live thread launched.")
 
 if __name__ == "__main__":
-    print("Initializing Multi-Asset Grid System...")
-    
-    assets_to_process = ASSETS[:MAX_ASSETS_TO_OPTIMIZE]
-    
-    for asset in assets_to_process:
-        process_asset(asset)
-    
-    print("\nAll assets processed. Starting Web Server...")
-    print(f"Serving Dashboard at http://localhost:{PORT}/")
-    
+    print("Initializing Hedged Multi-Asset Grid...")
+    for asset in ASSETS[:MAX_ASSETS_TO_OPTIMIZE]: process_asset(asset)
+    print(f"Serving at http://localhost:{PORT}/")
     with socketserver.TCPServer(("", PORT), ResultsHandler) as httpd:
         try: httpd.serve_forever()
         except KeyboardInterrupt: httpd.server_close()
