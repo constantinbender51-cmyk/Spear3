@@ -1,418 +1,364 @@
+import requests
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import requests
-import io
-import os
-import http.server
-import socketserver
 import time
-from datetime import datetime
+import datetime
+from deap import base, creator, tools, algorithms
 import random
+from flask import Flask, render_template_string
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import threading
+import logging
 
-# --- Configuration ---
-TRAIN_SPLIT = 0.70  # 70/30 Split
+# --- CONFIGURATION ---
+SYMBOL = 'ETHUSDT'
+INTERVAL = '1h'
+YEARS = 3
 PORT = 8080
+POPULATION_SIZE = 50
+GENERATIONS = 10
+hof = tools.HallOfFame(1)
 
-# Trading Costs (Fixed)
-FEE = 0.002
-SLIPPAGE = 0.001
+# Logging setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
 
-# GA Parameters
-POP_SIZE = 200
-GENERATIONS = 40
-MUTATION_RATE = 0.2
-CROSSOVER_RATE = 0.7
-
-# Strategy Constraints
-NUM_LEVELS = 50 
-
-# Optimization Bounds
-MIN_SL = 0.001   # 0.1%
-MAX_SL = 0.05    # 5.0%
-MIN_TP = 0.005   # 0.5%
-MAX_TP = 0.10    # 10.0%
-
-# SMA Offset Bounds (Percentage from SMA)
-MIN_OFFSET = -0.20  # -20% from SMA
-MAX_OFFSET = 0.20   # +20% from SMA
-
-def fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01"):
+# --- 1. DATA FETCHING ---
+def fetch_binance_data(symbol, interval, years):
     base_url = "https://api.binance.com/api/v3/klines"
-    start_dt = datetime.strptime(start_str, "%Y-%m-%d")
-    start_ts = int(start_dt.timestamp() * 1000)
-    end_ts = int(time.time() * 1000)
+    end_time = int(time.time() * 1000)
+    start_time = int((datetime.datetime.now() - datetime.timedelta(days=years*365)).timestamp() * 1000)
     
     all_data = []
-    current_start = start_ts
+    current_start = start_time
     
-    print(f"Fetching {symbol} {interval} data from {start_str}...")
+    logger.info(f"Fetching {years} years of {interval} data for {symbol}...")
     
-    # Calculate ms per interval for pagination
-    interval_map = {"1m": 60000, "30m": 1800000, "1h": 3600000}
-    step_ms = interval_map.get(interval, 3600000)
-
-    while True:
+    while current_start < end_time:
         params = {
-            "symbol": symbol,
-            "interval": interval,
-            "startTime": current_start,
-            "limit": 1000 
+            'symbol': symbol,
+            'interval': interval,
+            'startTime': current_start,
+            'limit': 1000
         }
+        response = requests.get(base_url, params=params)
+        data = response.json()
         
-        try:
-            r = requests.get(base_url, params=params)
-            r.raise_for_status()
-            data = r.json()
-            
-            if not data:
-                break
-                
-            all_data.extend(data)
-            last_open_time = data[-1][0]
-            current_start = last_open_time + step_ms
-            
-            last_date = datetime.fromtimestamp(last_open_time / 1000)
-            print(f"Fetched up to {last_date}...", end='\r')
-            
-            if current_start > end_ts:
-                break
-            time.sleep(0.1)
-            
-        except Exception as e:
-            print(f"\nError fetching data: {e}")
+        if not data:
             break
             
-    print(f"\nDownload complete. Total candles: {len(all_data)}")
-    
+        all_data.extend(data)
+        current_start = data[-1][0] + 1
+        time.sleep(0.1) # Rate limit handling
+        
     df = pd.DataFrame(all_data, columns=[
-        "open_time", "open", "high", "low", "close", "volume", 
-        "close_time", "q_vol", "trades", "tb_base", "tb_quote", "ignore"
+        'open_time', 'open', 'high', 'low', 'close', 'volume', 
+        'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
     ])
     
-    cols = ["open", "high", "low", "close", "volume"]
-    for c in cols:
-        df[c] = df[c].astype(float)
+    df['timestamp'] = pd.to_datetime(df['open_time'], unit='ms')
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = df[col].astype(float)
+    
+    df.set_index('timestamp', inplace=True)
+    logger.info(f"Fetched {len(df)} candles.")
+    return df[['open', 'high', 'low', 'close']]
+
+# --- 2. QUARTER SPLITTING & UTILS ---
+def split_into_cycles(df):
+    """
+    Splits data into 4-month cycles.
+    Structure: 
+    - Month 1-2: Train (GA)
+    - Month 3: Gap (Ignored per prompt implication or used as validation, but prompt skips it)
+    - Month 4: Test
+    """
+    # Group by year and month
+    groups = [g for n, g in df.groupby(pd.Grouper(freq='M'))]
+    
+    cycles = []
+    # We need chunks of 4 months
+    for i in range(0, len(groups) - 3, 4):
+        cycle_data = {
+            'train': pd.concat([groups[i], groups[i+1]]),
+            'gap': groups[i+2],
+            'test': groups[i+3],
+            'id': f"Cycle_{i//4 + 1}_{groups[i].index[0].strftime('%Y-%b')}"
+        }
+        cycles.append(cycle_data)
+    return cycles
+
+# --- 3. STRATEGY & BACKTESTING ---
+def backtest(df, params):
+    """
+    Params: [buy_reversal_pct, sell_reversal_pct, stop_loss_pct, take_profit_pct]
+    Strategy: 
+    - Calculate a rolling mean (simple anchor).
+    - Buy if Price < Mean * (1 - buy_reversal_pct)
+    - Sell (Short) if Price > Mean * (1 + sell_reversal_pct)
+    - Exit on SL or TP.
+    """
+    buy_rev, sell_rev, sl, tp = params
+    
+    # Vectorized signal generation is hard with complex SL/TP path dependency, 
+    # employing fast iteration with numba is ideal, but using standard loop for compatibility.
+    
+    closes = df['close'].values
+    opens = df['open'].values
+    highs = df['high'].values
+    lows = df['low'].values
+    times = df.index
+    
+    # Simple Mean Reversion Reference: 24h SMA
+    sma = df['close'].rolling(window=24).mean().fillna(method='bfill').values
+    
+    position = 0 # 1: Long, -1: Short, 0: Flat
+    entry_price = 0.0
+    equity = [1000.0] # Start with $1000
+    trades = []
+    
+    for i in range(len(closes)):
+        current_price = closes[i]
+        current_sma = sma[i]
+        curr_equity = equity[-1]
         
-    return df
+        # Check Exits first
+        if position == 1:
+            # Long Exit
+            if lows[i] <= entry_price * (1 - sl): # Stop Loss
+                curr_equity *= (1 - sl)
+                position = 0
+                trades.append({'time': times[i], 'type': 'exit_sl_long', 'price': entry_price * (1 - sl), 'pnl': -sl})
+            elif highs[i] >= entry_price * (1 + tp): # Take Profit
+                curr_equity *= (1 + tp)
+                position = 0
+                trades.append({'time': times[i], 'type': 'exit_tp_long', 'price': entry_price * (1 + tp), 'pnl': tp})
+                
+        elif position == -1:
+            # Short Exit
+            if highs[i] >= entry_price * (1 + sl): # Stop Loss
+                curr_equity *= (1 - sl)
+                position = 0
+                trades.append({'time': times[i], 'type': 'exit_sl_short', 'price': entry_price * (1 + sl), 'pnl': -sl})
+            elif lows[i] <= entry_price * (1 - tp): # Take Profit
+                curr_equity *= (1 + tp)
+                position = 0
+                trades.append({'time': times[i], 'type': 'exit_tp_short', 'price': entry_price * (1 - tp), 'pnl': tp})
 
-class Backtester:
-    def __init__(self, df):
-        self.df = df.copy().reset_index(drop=True)
-        self.high = self.df['high'].values
-        self.low = self.df['low'].values
-        self.open = self.df['open'].values
-        self.close = self.df['close'].values
-        self.sma = self.df['sma'].values
-        self.n = len(df)
+        # Check Entries (only if flat)
+        if position == 0:
+            # Buy Limit
+            target_buy = current_sma * (1 - buy_rev)
+            if lows[i] <= target_buy:
+                position = 1
+                entry_price = target_buy
+                trades.append({'time': times[i], 'type': 'long', 'price': entry_price})
+            
+            # Sell Limit
+            target_sell = current_sma * (1 + sell_rev)
+            if highs[i] >= target_sell:
+                position = -1
+                entry_price = target_sell
+                trades.append({'time': times[i], 'type': 'short', 'price': entry_price})
 
-    def run(self, level_offsets, stop_loss, take_profit):
+        equity.append(curr_equity)
+        
+    returns = pd.Series(equity).pct_change().fillna(0)
+    sharpe = np.sqrt(len(equity)) * (returns.mean() / returns.std()) if returns.std() != 0 else 0
+    return sharpe, equity, trades
+
+# --- 4. GENETIC ALGORITHM ---
+# Genes: [Buy_Rev%, Sell_Rev%, SL%, TP%]
+# Bounds: Rev (0.001 - 0.05), SL (0.001 - 0.05), TP (0.005 - 0.10)
+
+creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+creator.create("Individual", list, fitness=creator.FitnessMax)
+
+toolbox = base.Toolbox()
+toolbox.register("attr_rev", random.uniform, 0.001, 0.05)
+toolbox.register("attr_sl", random.uniform, 0.005, 0.03) # Tighter SL
+toolbox.register("attr_tp", random.uniform, 0.01, 0.10)  # Wider TP
+
+toolbox.register("individual", tools.initCycle, creator.Individual, 
+                 (toolbox.attr_rev, toolbox.attr_rev, toolbox.attr_sl, toolbox.attr_tp), n=1)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+def evaluate(individual, data):
+    # Only return fitness (Sharpe)
+    sharpe, _, _ = backtest(data, individual)
+    return (sharpe,)
+
+toolbox.register("mate", tools.cxTwoPoint)
+toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=0.01, indpb=0.2)
+toolbox.register("select", tools.selTournament, tournsize=3)
+
+def run_ga(train_data):
+    # Bind the specific data to the evaluation function
+    toolbox.register("evaluate", evaluate, data=train_data)
+    
+    pop = toolbox.population(n=POPULATION_SIZE)
+    
+    # Add bounds handling to mutation
+    def checkBounds(min_v, max_v):
+        def decorator(func):
+            def wrapper(*args, **kargs):
+                offspring = func(*args, **kargs)
+                for child in offspring:
+                    for i in range(len(child)):
+                        if child[i] < min_v: child[i] = min_v
+                        if child[i] > max_v: child[i] = max_v
+                return offspring
+            return wrapper
+        return decorator
+
+    toolbox.decorate("mutate", checkBounds(0.001, 0.15))
+    
+    final_pop, log = algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, 
+                                         ngen=GENERATIONS, stats=None, 
+                                         halloffame=hof, verbose=False)
+    return hof[0]
+
+# --- 5. MAIN EXECUTION LOOP ---
+results_store = []
+
+def process_data():
+    global results_store
+    df = fetch_binance_data(SYMBOL, INTERVAL, YEARS)
+    cycles = split_into_cycles(df)
+    
+    cumulative_equity = 1000.0
+    
+    logger.info(f"Identified {len(cycles)} backtesting cycles.")
+    
+    for cycle in cycles:
+        train_df = cycle['train']
+        test_df = cycle['test']
+        
+        logger.info(f"Optimizing {cycle['id']} (Train: {len(train_df)} hrs)...")
+        
+        # Optimize on Months 1 & 2
+        best_ind = run_ga(train_df)
+        
+        # Test on Month 4
+        logger.info(f"Testing {cycle['id']} (Test: {len(test_df)} hrs)... params: {[round(x,4) for x in best_ind]}")
+        sharpe, equity_curve, trades = backtest(test_df, best_ind)
+        
+        # Calculate real PnL for this segment
+        segment_return = (equity_curve[-1] - equity_curve[0]) / equity_curve[0]
+        cumulative_equity *= (1 + segment_return)
+        
+        results_store.append({
+            'cycle': cycle['id'],
+            'params': best_ind,
+            'sharpe': sharpe,
+            'segment_pnl_pct': segment_return * 100,
+            'cumulative_equity': cumulative_equity,
+            'test_data': test_df,
+            'trades': trades
+        })
+
+# --- 6. FLASK SERVER & VISUALIZATION ---
+app = Flask(__name__)
+
+@app.route('/')
+def dashboard():
+    if not results_store:
+        return "<h1>Processing Data... Please refresh in a minute.</h1>"
+    
+    # Create Plotly Graph
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.03, subplot_titles=('Price & Entries', 'Cumulative Equity'),
+                        row_width=[0.3, 0.7])
+
+    # Concatenate test data for visualization
+    combined_test_df = pd.DataFrame()
+    
+    # Plotting loop
+    colors = ['blue', 'orange', 'green', 'red', 'purple', 'brown'] * 10
+    
+    current_eq_base = 1000
+    
+    for idx, res in enumerate(results_store):
+        df = res['test_data']
+        trades = res['trades']
+        
+        # Candlestick
+        fig.add_trace(go.Candlestick(x=df.index,
+                        open=df['open'], high=df['high'],
+                        low=df['low'], close=df['close'],
+                        name=f"{res['cycle']} Price"), row=1, col=1)
+        
+        # Entries/Exits Markers
+        for t in trades:
+            color = 'Green' if 'long' in t['type'] and 'exit' not in t['type'] else \
+                    'Red' if 'short' in t['type'] and 'exit' not in t['type'] else \
+                    'Black' # Exits
+            
+            symbol = 'triangle-up' if 'long' in t['type'] and 'exit' not in t['type'] else \
+                     'triangle-down' if 'short' in t['type'] and 'exit' not in t['type'] else \
+                     'x'
+                     
+            fig.add_trace(go.Scatter(x=[t['time']], y=[t['price']], mode='markers',
+                                     marker=dict(symbol=symbol, color=color, size=10),
+                                     showlegend=False,
+                                     name=t['type']), row=1, col=1)
+
+        # Equity Curve (reconstructed roughly for visualization)
+        # We just plot the end point of each cycle to show growth
+        fig.add_trace(go.Scatter(x=[df.index[-1]], y=[res['cumulative_equity']], 
+                                 mode='markers+lines', marker=dict(color='blue'),
+                                 name='Equity Checkpoint'), row=2, col=1)
+
+    fig.update_layout(height=800, title_text="ETH 3-Year Quarterly Walk-Forward (Train M1-2, Test M4)", template="plotly_dark")
+    
+    graph_html = fig.to_html(full_html=False)
+    
+    # Stats Table
+    stats_html = """
+    <table border="1" style="border-collapse: collapse; width: 100%; color: white; font-family: sans-serif;">
+        <tr style="background-color: #333;">
+            <th>Cycle</th><th>Buy Rev %</th><th>Sell Rev %</th><th>SL %</th><th>TP %</th><th>Test Sharpe</th><th>PnL %</th><th>Cum Equity</th>
+        </tr>
+    """
+    for res in results_store:
+        p = res['params']
+        stats_html += f"""
+        <tr>
+            <td>{res['cycle']}</td>
+            <td>{p[0]*100:.2f}%</td>
+            <td>{p[1]*100:.2f}%</td>
+            <td>{p[2]*100:.2f}%</td>
+            <td>{p[3]*100:.2f}%</td>
+            <td>{res['sharpe']:.4f}</td>
+            <td style="color: {'lime' if res['segment_pnl_pct'] > 0 else 'red'}">{res['segment_pnl_pct']:.2f}%</td>
+            <td>${res['cumulative_equity']:.2f}</td>
+        </tr>
         """
-        Executes the strategy with dynamic levels based on SMA offsets.
-        Direction: Reversal (Opposite direction of touch).
-        """
-        position = 0
-        entry_price = 0.0
-        equity = [10000.0]
-        trades = []
-        
-        if len(level_offsets) == 0:
-            return equity, trades
+    stats_html += "</table>"
 
-        offsets = np.array(level_offsets)
-        
-        for t in range(1, self.n):
-            current_equity = equity[-1]
-            h = self.high[t]
-            l = self.low[t]
-            prev_c = self.close[t-1]
-            current_sma = self.sma[t]
-            
-            # --- Check Exit ---
-            if position != 0:
-                pnl = 0.0
-                executed = False
-                
-                if position == 1:
-                    sl_price = entry_price * (1 - stop_loss)
-                    tp_price = entry_price * (1 + take_profit)
-                    
-                    if l <= sl_price:
-                        exit_price = sl_price * (1 - SLIPPAGE)
-                        pnl = (exit_price - entry_price) / entry_price
-                        pnl -= FEE 
-                        executed = True
-                    elif h >= tp_price:
-                        exit_price = tp_price * (1 - SLIPPAGE)
-                        pnl = (exit_price - entry_price) / entry_price
-                        pnl -= FEE
-                        executed = True
-                
-                elif position == -1:
-                    sl_price = entry_price * (1 + stop_loss)
-                    tp_price = entry_price * (1 - take_profit)
-                    
-                    if h >= sl_price:
-                        exit_price = sl_price * (1 + SLIPPAGE)
-                        pnl = (entry_price - exit_price) / entry_price
-                        pnl -= FEE
-                        executed = True
-                    elif l <= tp_price:
-                        exit_price = tp_price * (1 + SLIPPAGE)
-                        pnl = (entry_price - exit_price) / entry_price
-                        pnl -= FEE
-                        executed = True
-
-                if executed:
-                    new_equity = current_equity * (1 + pnl)
-                    equity.append(new_equity)
-                    trades.append(pnl)
-                    position = 0
-                    entry_price = 0.0
-                    continue 
-            
-            # --- Check Entry ---
-            if position == 0:
-                # Calculate dynamic levels for current timestamp
-                current_levels = current_sma * (1 + offsets)
-                
-                # Filter relevant levels strictly within high/low
-                mask = (current_levels >= l) & (current_levels <= h)
-                
-                if np.any(mask):
-                    relevant_levels = current_levels[mask]
-                    for lvl in relevant_levels:
-                        if prev_c < lvl <= h:
-                            # Cross UP -> SHORT (Reversal: Betting on Resistance)
-                            fill_price = lvl
-                            position = -1
-                            entry_price = fill_price * (1 - SLIPPAGE) 
-                            current_equity = current_equity * (1 - FEE) 
-                            break 
-                        
-                        elif prev_c > lvl >= l:
-                            # Cross DOWN -> LONG (Reversal: Betting on Support)
-                            fill_price = lvl
-                            position = 1
-                            entry_price = fill_price * (1 + SLIPPAGE)
-                            current_equity = current_equity * (1 - FEE)
-                            break 
-            
-            equity.append(current_equity)
-            
-        return equity, trades
-
-class GeneticOptimizer:
-    def __init__(self, data_train, pop_size=POP_SIZE, generations=GENERATIONS):
-        self.data = data_train
-        self.pop_size = pop_size
-        self.generations = generations
-        self.backtester = Backtester(data_train)
-        
-        self.gene_length = 2 + NUM_LEVELS
-        self.population = np.random.rand(pop_size, self.gene_length)
-        
-    def decode_chromosome(self, chrom):
-        # 1. Decode SL
-        sl_norm = chrom[0]
-        stop_loss = MIN_SL + sl_norm * (MAX_SL - MIN_SL)
-        
-        # 2. Decode TP
-        tp_norm = chrom[1]
-        take_profit = MIN_TP + tp_norm * (MAX_TP - MIN_TP)
-        
-        # 3. Decode Level Offsets
-        offsets_norm = chrom[2:]
-        offsets = MIN_OFFSET + offsets_norm * (MAX_OFFSET - MIN_OFFSET)
-        offsets.sort()
-        
-        return offsets, stop_loss, take_profit
-
-    def fitness(self, chrom):
-        offsets, sl, tp = self.decode_chromosome(chrom)
-        equity, trades = self.backtester.run(offsets, sl, tp)
-        
-        if len(trades) < 2 or equity[-1] <= 100.0:
-            return -10.0
-        
-        equity_curve = np.array(equity)
-        returns = np.diff(equity_curve) / equity_curve[:-1]
-        
-        std_dev = np.std(returns)
-        if std_dev < 1e-9:
-            return -10.0
-        
-        # Sharpe Ratio (Annualized for 1h candles)
-        annualization_factor = np.sqrt(24 * 365)
-        sharpe = (np.mean(returns) / std_dev) * annualization_factor
-        
-        return sharpe
-
-    def evolve(self):
-        print(f"Starting Optimization: {self.generations} Gens, Pop {self.pop_size}, Levels {NUM_LEVELS}")
-        print(f"Optimizing for Sharpe Ratio (1h timeframe) - REVERSAL Strategy")
-        print(f"Ranges: SL ({MIN_SL*100}%-{MAX_SL*100}%) | TP ({MIN_TP*100}%-{MAX_TP*100}%)")
-        print(f"SMA Offsets: {MIN_OFFSET*100}% to {MAX_OFFSET*100}%")
-        
-        for gen in range(self.generations):
-            scores = []
-            for i in range(self.pop_size):
-                scores.append(self.fitness(self.population[i]))
-            
-            scores = np.array(scores)
-            best_idx = np.argmax(scores)
-            best_sharpe = scores[best_idx]
-            
-            _, b_sl, b_tp = self.decode_chromosome(self.population[best_idx])
-            print(f"Gen {gen+1}/{self.generations} | Sharpe: {best_sharpe:.4f} | SL: {b_sl*100:.2f}% | TP: {b_tp*100:.2f}%")
-            
-            new_pop = np.zeros_like(self.population)
-            new_pop[0] = self.population[best_idx]
-            
-            for i in range(1, self.pop_size):
-                cands = np.random.choice(self.pop_size, 3)
-                p1_idx = cands[np.argmax(scores[cands])]
-                cands = np.random.choice(self.pop_size, 3)
-                p2_idx = cands[np.argmax(scores[cands])]
-                
-                parent1 = self.population[p1_idx]
-                parent2 = self.population[p2_idx]
-                
-                if np.random.rand() < CROSSOVER_RATE:
-                    cross_point = np.random.randint(1, self.gene_length)
-                    child = np.concatenate((parent1[:cross_point], parent2[cross_point:]))
-                else:
-                    child = parent1.copy()
-                
-                mutation_mask = np.random.rand(self.gene_length) < MUTATION_RATE
-                random_genes = np.random.rand(self.gene_length)
-                child[mutation_mask] = random_genes[mutation_mask]
-                
-                new_pop[i] = child
-            
-            self.population = new_pop
-            
-        final_scores = [self.fitness(p) for p in self.population]
-        best_chrom = self.population[np.argmax(final_scores)]
-        return best_chrom
-
-def plot_candlesticks(df, filename="ohlc.png"):
-    plt.figure(figsize=(14, 8))
-    df_plot = df.reset_index(drop=True)
-    
-    up_color = '#2ca02c'
-    down_color = '#d62728'
-    width = 0.6
-    width2 = 0.05
-    
-    up = df_plot[df_plot.close >= df_plot.open]
-    down = df_plot[df_plot.close < df_plot.open]
-    
-    plt.bar(up.index, up.close - up.open, width, bottom=up.open, color=up_color)
-    plt.bar(up.index, up.high - up.close, width2, bottom=up.close, color=up_color)
-    plt.bar(up.index, up.low - up.open, width2, bottom=up.open, color=up_color)
-    
-    plt.bar(down.index, down.open - down.close, width, bottom=down.close, color=down_color)
-    plt.bar(down.index, down.high - down.open, width2, bottom=down.open, color=down_color)
-    plt.bar(down.index, down.low - down.close, width2, bottom=down.close, color=down_color)
-
-    if 'sma' in df_plot.columns:
-        plt.plot(df_plot.index, df_plot['sma'], color='blue', label='SMA 365', linewidth=1.5)
-
-    plt.title('Test Data: OHLC & SMA 365')
-    plt.xlabel('Time (Candles)')
-    plt.ylabel('Price')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(filename)
-    plt.close()
-
-def main():
-    df = fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01")
-    
-    print("Calculating SMA 365...")
-    df['sma'] = df['close'].rolling(window=365).mean()
-    df.dropna(inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    
-    split_idx = int(len(df) * TRAIN_SPLIT)
-    train_df = df.iloc[:split_idx]
-    test_df = df.iloc[split_idx:]
-    
-    print(f"Data prepared. Train size: {len(train_df)}, Test size: {len(test_df)}")
-    
-    optimizer = GeneticOptimizer(train_df)
-    best_chrom = optimizer.evolve()
-    best_offsets, best_sl, best_tp = optimizer.decode_chromosome(best_chrom)
-    
-    print(f"Optimization complete.")
-    print(f"Best SL: {best_sl*100:.2f}%")
-    print(f"Best TP: {best_tp*100:.2f}%")
-    
-    bt = Backtester(test_df)
-    equity, trades = bt.run(best_offsets, best_sl, best_tp)
-    
-    os.makedirs("output", exist_ok=True)
-    
-    plt.figure(figsize=(12, 6))
-    plt.plot(equity, label='Equity Curve (Test Data)')
-    plt.title(f'Strategy Performance (Test Data)\nSMA Offsets: {len(best_offsets)} | SL: {best_sl*100:.2f}% | TP: {best_tp*100:.2f}%')
-    plt.xlabel('Candles')
-    plt.ylabel('Capital ($)')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('output/equity.png')
-    plt.close()
-
-    print("Generating OHLC plot...")
-    plot_candlesticks(test_df, "output/ohlc.png")
-    
-    total_return = (equity[-1] - 10000) / 10000 * 100
-    win_rate = len([t for t in trades if t > 0]) / len(trades) * 100 if trades else 0
-    
-    html_content = f"""
+    html = f"""
     <html>
-    <head><title>Trading Strategy Report</title></head>
-    <body style="font-family: monospace; padding: 20px;">
-        <h1>Optimization Results - Reversal Strategy</h1>
-        <hr>
-        <h2>Metrics (Test Set {100-TRAIN_SPLIT*100:.0f}%)</h2>
-        <ul>
-            <li>Initial Capital: $10,000</li>
-            <li>Final Capital: ${equity[-1]:.2f}</li>
-            <li>Total Return: {total_return:.2f}%</li>
-            <li>Total Trades: {len(trades)}</li>
-            <li>Win Rate: {win_rate:.2f}%</li>
-            <li>Optimized SL: {best_sl*100:.2f}%</li>
-            <li>Optimized TP: {best_tp*100:.2f}%</li>
-        </ul>
-        <hr>
-        <h2>Equity Curve</h2>
-        <img src="equity.png" style="max-width: 100%; border: 1px solid #ddd;">
-        <hr>
-        <h2>Price Action & SMA</h2>
-        <img src="ohlc.png" style="max-width: 100%; border: 1px solid #ddd;">
-        <hr>
-        <h2>SMA Offset Levels (%)</h2>
-        <p>{list(np.round(best_offsets * 100, 2))}</p>
-    </body>
+        <head><title>Bot Results</title></head>
+        <body style="background-color: #111; color: #ddd;">
+            <h1 style="text-align:center">Genetic Algorithm Strategy Backtest</h1>
+            {graph_html}
+            <div style="padding: 20px;">
+                {stats_html}
+            </div>
+        </body>
     </html>
     """
-    
-    with open("output/index.html", "w") as f:
-        f.write(html_content)
-        
-    print(f"Results saved to output/. Serving on port {PORT}...")
-    
-    os.chdir("output")
-    with socketserver.TCPServer(("", PORT), http.server.SimpleHTTPRequestHandler) as httpd:
-        print(f"Serving at http://localhost:{PORT}")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            httpd.server_close()
-            print("Server stopped.")
+    return render_template_string(html)
+
+def run_server():
+    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    main()
+    # Start data processing in background
+    t = threading.Thread(target=process_data)
+    t.start()
+    
+    # Start Web Server
+    print(f"Server starting on http://localhost:{PORT}")
+    run_server()
