@@ -139,7 +139,7 @@ def fitness_func(ga_instance, solution, solution_idx):
     final_val, _ = backtest(solution, train_data, fee_pct=0.0)
     return final_val
 
-num_generations = 20
+num_generations = 40
 num_parents_mating = 4
 sol_per_pop = 10
 num_genes = 34
