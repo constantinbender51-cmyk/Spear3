@@ -6,11 +6,11 @@ import io
 import os
 import http.server
 import socketserver
+import time
 from datetime import datetime
 import random
 
 # --- Configuration ---
-DATA_URL = "https://ohlcendpoint.up.railway.app/data/btc1h.csv"
 TRAIN_SPLIT = 0.90
 PORT = 8080
 
@@ -21,12 +21,82 @@ STOP_LOSS = 0.005
 TAKE_PROFIT = 0.03
 
 # GA Parameters
-POP_SIZE = 100
-GENERATIONS = 40
+POP_SIZE = 50
+GENERATIONS = 20
 MUTATION_RATE = 0.1
 CROSSOVER_RATE = 0.7
 MAX_LEVELS = 100
 MIN_LEVELS = 5
+
+def fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01"):
+    """
+    Fetches historical OHLC data from Binance API.
+    """
+    base_url = "https://api.binance.com/api/v3/klines"
+    
+    # Convert start string to ms timestamp
+    start_dt = datetime.strptime(start_str, "%Y-%m-%d")
+    start_ts = int(start_dt.timestamp() * 1000)
+    
+    # End time is now
+    end_ts = int(time.time() * 1000)
+    
+    all_data = []
+    current_start = start_ts
+    
+    print(f"Fetching {symbol} {interval} data from {start_str}...")
+    
+    while True:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": current_start,
+            "limit": 1000 
+        }
+        
+        try:
+            r = requests.get(base_url, params=params)
+            r.raise_for_status()
+            data = r.json()
+            
+            if not data:
+                break
+                
+            all_data.extend(data)
+            
+            # Update start time: Last candle open time + 1 interval (1h = 3600000ms)
+            last_open_time = data[-1][0]
+            current_start = last_open_time + 3600000
+            
+            # Progress indicator
+            last_date = datetime.fromtimestamp(last_open_time / 1000)
+            print(f"Fetched up to {last_date}...", end='\r')
+            
+            if current_start > end_ts:
+                break
+                
+            # Rate limit protection (Binance is generous, but safe side)
+            time.sleep(0.1)
+            
+        except Exception as e:
+            print(f"\nError fetching data: {e}")
+            break
+            
+    print(f"\nDownload complete. Total candles: {len(all_data)}")
+    
+    # Binance Columns: 
+    # 0: Open time, 1: Open, 2: High, 3: Low, 4: Close, 5: Volume, ...
+    df = pd.DataFrame(all_data, columns=[
+        "open_time", "open", "high", "low", "close", "volume", 
+        "close_time", "q_vol", "trades", "tb_base", "tb_quote", "ignore"
+    ])
+    
+    # Type conversion
+    cols = ["open", "high", "low", "close", "volume"]
+    for c in cols:
+        df[c] = df[c].astype(float)
+        
+    return df
 
 class Backtester:
     def __init__(self, df):
@@ -38,10 +108,9 @@ class Backtester:
         self.n = len(df)
 
     def run(self, price_levels):
-        # State
-        position = 0  # 0: Flat, 1: Long, -1: Short
+        position = 0
         entry_price = 0.0
-        equity = [10000.0]  # Start with 10k
+        equity = [10000.0]
         trades = []
         
         if len(price_levels) == 0:
@@ -56,7 +125,6 @@ class Backtester:
             o = self.open[t]
             prev_c = self.close[t-1]
             
-            # --- Check Exit (if position exists) ---
             if position != 0:
                 pnl = 0.0
                 executed = False
@@ -99,14 +167,12 @@ class Backtester:
                     entry_price = 0.0
                     continue 
             
-            # --- Check Entry (if flat) ---
             if position == 0:
                 relevant_levels = levels[(levels >= l) & (levels <= h)]
                 
                 if len(relevant_levels) > 0:
                     for lvl in relevant_levels:
                         if prev_c < lvl <= h:
-                            # Short Trigger
                             fill_price = lvl
                             position = -1
                             entry_price = fill_price * (1 - SLIPPAGE) 
@@ -114,7 +180,6 @@ class Backtester:
                             break 
                         
                         elif prev_c > lvl >= l:
-                            # Long Trigger
                             fill_price = lvl
                             position = 1
                             entry_price = fill_price * (1 + SLIPPAGE)
@@ -200,36 +265,25 @@ class GeneticOptimizer:
         return best_chrom
 
 def plot_candlesticks(df, levels, filename="ohlc.png"):
-    """Manually plots candlesticks to avoid mplfinance dependency"""
     plt.figure(figsize=(14, 8))
-    
-    # Reset index for easy plotting
     df_plot = df.reset_index(drop=True)
     
-    # Define colors
-    up_color = '#2ca02c'   # Green
-    down_color = '#d62728' # Red
-    
-    # Width of candlestick elements
+    up_color = '#2ca02c'
+    down_color = '#d62728'
     width = 0.6
     width2 = 0.05
     
-    # Identify up/down days
     up = df_plot[df_plot.close >= df_plot.open]
     down = df_plot[df_plot.close < df_plot.open]
     
-    # Plot Up candles
     plt.bar(up.index, up.close - up.open, width, bottom=up.open, color=up_color)
     plt.bar(up.index, up.high - up.close, width2, bottom=up.close, color=up_color)
     plt.bar(up.index, up.low - up.open, width2, bottom=up.open, color=up_color)
     
-    # Plot Down candles
     plt.bar(down.index, down.open - down.close, width, bottom=down.close, color=down_color)
     plt.bar(down.index, down.high - down.open, width2, bottom=down.open, color=down_color)
     plt.bar(down.index, down.low - down.close, width2, bottom=down.close, color=down_color)
 
-    # Overlay Levels
-    # We use a secondary axis logic or just plot horizontal lines across the whole range
     xmin, xmax = 0, len(df_plot)
     for level in levels:
         plt.hlines(level, xmin, xmax, colors='blue', linestyles='dashed', alpha=0.6, linewidth=0.8)
@@ -243,14 +297,8 @@ def plot_candlesticks(df, levels, filename="ohlc.png"):
     plt.close()
 
 def main():
-    # 1. Download Data
-    print("Downloading data...")
-    r = requests.get(DATA_URL)
-    if r.status_code != 200:
-        raise Exception("Failed to download data")
-    
-    df = pd.read_csv(io.StringIO(r.text))
-    df.columns = [c.lower() for c in df.columns]
+    # 1. Fetch Data from Binance
+    df = fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01")
     
     # 2. Split Data
     split_idx = int(len(df) * TRAIN_SPLIT)
@@ -273,7 +321,6 @@ def main():
     # 5. Generate Reports
     os.makedirs("output", exist_ok=True)
     
-    # Plot Equity
     plt.figure(figsize=(12, 6))
     plt.plot(equity, label='Equity Curve (Test Data)')
     plt.title(f'Strategy Performance (Test Data)\nLevels: {len(best_levels)}')
@@ -284,11 +331,9 @@ def main():
     plt.savefig('output/equity.png')
     plt.close()
 
-    # Plot OHLC with Levels (Test Data Only for Clarity)
     print("Generating OHLC plot...")
     plot_candlesticks(test_df, best_levels, "output/ohlc.png")
     
-    # Stats
     total_return = (equity[-1] - 10000) / 10000 * 100
     win_rate = len([t for t in trades if t > 0]) / len(trades) * 100 if trades else 0
     
@@ -325,7 +370,6 @@ def main():
         
     print(f"Results saved to output/. Serving on port {PORT}...")
     
-    # 6. Serve
     os.chdir("output")
     with socketserver.TCPServer(("", PORT), http.server.SimpleHTTPRequestHandler) as httpd:
         print(f"Serving at http://localhost:{PORT}")
