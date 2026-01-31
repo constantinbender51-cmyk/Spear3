@@ -27,7 +27,7 @@ lows = df['low'].values
 opens = df['open'].values
 
 # 2. Split Data (70/30)
-split_idx = int(len(df) * 0.70)
+split_idx = int(len(df) * 0.9)
 train_data = {
     'open': opens[:split_idx],
     'high': highs[:split_idx],
