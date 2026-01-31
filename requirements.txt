@@ -1,3 +1,4 @@
+pygad
 pandas
 numpy
 matplotlib
