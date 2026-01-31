@@ -21,8 +21,8 @@ STOP_LOSS = 0.005
 TAKE_PROFIT = 0.03
 
 # GA Parameters
-POP_SIZE = 50
-GENERATIONS = 20
+POP_SIZE = 100
+GENERATIONS = 40
 MUTATION_RATE = 0.1
 CROSSOVER_RATE = 0.7
 MAX_LEVELS = 100
@@ -38,17 +38,12 @@ class Backtester:
         self.n = len(df)
 
     def run(self, price_levels):
-        """
-        Executes the strategy.
-        price_levels: sorted list of active price levels.
-        """
         # State
         position = 0  # 0: Flat, 1: Long, -1: Short
         entry_price = 0.0
         equity = [10000.0]  # Start with 10k
         trades = []
         
-        # Pre-calculation for speed
         if len(price_levels) == 0:
             return equity, trades
 
@@ -66,16 +61,13 @@ class Backtester:
                 pnl = 0.0
                 executed = False
                 
-                # Long Exit Logic
                 if position == 1:
                     sl_price = entry_price * (1 - STOP_LOSS)
                     tp_price = entry_price * (1 + TAKE_PROFIT)
                     
-                    # Check worst case: SL hit first if both triggered (Conservative)
                     if l <= sl_price:
-                        exit_price = sl_price * (1 - SLIPPAGE) # Sell order slippage
+                        exit_price = sl_price * (1 - SLIPPAGE)
                         pnl = (exit_price - entry_price) / entry_price
-                        # Fee on exit
                         pnl -= FEE 
                         executed = True
                     elif h >= tp_price:
@@ -84,13 +76,12 @@ class Backtester:
                         pnl -= FEE
                         executed = True
                 
-                # Short Exit Logic
                 elif position == -1:
                     sl_price = entry_price * (1 + STOP_LOSS)
                     tp_price = entry_price * (1 - TAKE_PROFIT)
                     
                     if h >= sl_price:
-                        exit_price = sl_price * (1 + SLIPPAGE) # Buy order slippage
+                        exit_price = sl_price * (1 + SLIPPAGE)
                         pnl = (entry_price - exit_price) / entry_price
                         pnl -= FEE
                         executed = True
@@ -101,55 +92,30 @@ class Backtester:
                         executed = True
 
                 if executed:
-                    # Apply PnL
                     new_equity = current_equity * (1 + pnl)
                     equity.append(new_equity)
                     trades.append(pnl)
                     position = 0
                     entry_price = 0.0
-                    continue # Wait for next candle for new entry (simplify logic)
+                    continue 
             
             # --- Check Entry (if flat) ---
             if position == 0:
-                # Find relevant levels
-                # Short: Touch from below (Prev Close < Level <= High)
-                # Long: Touch from above (Prev Close > Level >= Low)
-                
-                # Optimization: Only check levels within candle range
                 relevant_levels = levels[(levels >= l) & (levels <= h)]
                 
                 if len(relevant_levels) > 0:
-                    # Prioritize the one closest to Open or first touched? 
-                    # Assuming limit orders exist, the first one hit is the one closest to Open.
-                    
-                    # Logic: 
-                    # If Short: Price goes UP to level. Level > Prev_Close.
-                    # If Long: Price goes DOWN to level. Level < Prev_Close.
-                    
                     for lvl in relevant_levels:
                         if prev_c < lvl <= h:
                             # Short Trigger
-                            # Entry Price calculation
                             fill_price = lvl
-                            
-                            # Execute Short
-                            # Sell at fill_price * (1 - slippage)
-                            # Fee deducted immediately from potential
                             position = -1
-                            # Effective cost basis accounting for slippage/fees in the PnL calculation later
-                            # For tracking "entry_price" we use the raw level, 
-                            # but we account for slippage/fee immediately on equity or at exit?
-                            # Standard: Record executed price.
                             entry_price = fill_price * (1 - SLIPPAGE) 
-                            # Pay entry fee
                             current_equity = current_equity * (1 - FEE) 
                             break 
                         
                         elif prev_c > lvl >= l:
                             # Long Trigger
                             fill_price = lvl
-                            
-                            # Execute Long
                             position = 1
                             entry_price = fill_price * (1 + SLIPPAGE)
                             current_equity = current_equity * (1 - FEE)
@@ -166,26 +132,15 @@ class GeneticOptimizer:
         self.generations = generations
         self.backtester = Backtester(data_train)
         
-        # Determine price bounds for gene normalization
         self.min_price = data_train['low'].min()
         self.max_price = data_train['high'].max()
         
-        # Population: [Count, Level_1_Norm, ..., Level_100_Norm]
-        # Gene 0: Number of levels (normalized 0-1, mapped to 5-100)
-        # Genes 1-100: Price levels (normalized 0-1)
         self.population = np.random.rand(pop_size, MAX_LEVELS + 1)
         
     def decode_chromosome(self, chrom):
-        # Decode Count
         count_norm = chrom[0]
         count = int(MIN_LEVELS + count_norm * (MAX_LEVELS - MIN_LEVELS))
-        
-        # Decode Levels
         levels_norm = chrom[1:]
-        # Extract active levels
-        active_indices = np.argsort(levels_norm)[:count] # Pick 'count' levels ? Or just first 'count'? 
-        # Better: Use the first 'count' genes after sorting them to ensure consistency?
-        # Strategy: Take first 'count' from the gene array, map to price, then sort.
         
         raw_levels = levels_norm[:count]
         prices = self.min_price + raw_levels * (self.max_price - self.min_price)
@@ -196,8 +151,6 @@ class GeneticOptimizer:
         levels = self.decode_chromosome(chrom)
         equity, _ = self.backtester.run(levels)
         
-        # Objective: Maximize Final Equity
-        # Penalty for 0 trades (avoid flatlines)
         if len(equity) == 0 or equity[-1] == 10000.0:
             return -1.0
             
@@ -216,13 +169,10 @@ class GeneticOptimizer:
             best_idx = np.argmax(scores)
             print(f"Gen {gen+1}/{self.generations} | Best Return: {scores[best_idx]*100:.2f}%")
             
-            # Selection (Tournament)
             new_pop = np.zeros_like(self.population)
-            # Elitism
             new_pop[0] = self.population[best_idx]
             
             for i in range(1, self.pop_size):
-                # Tourney size 3
                 candidates = np.random.choice(self.pop_size, 3)
                 parent1_idx = candidates[np.argmax(scores[candidates])]
                 candidates = np.random.choice(self.pop_size, 3)
@@ -231,14 +181,12 @@ class GeneticOptimizer:
                 parent1 = self.population[parent1_idx]
                 parent2 = self.population[parent2_idx]
                 
-                # Crossover
                 if np.random.rand() < CROSSOVER_RATE:
                     cross_point = np.random.randint(1, len(parent1))
                     child = np.concatenate((parent1[:cross_point], parent2[cross_point:]))
                 else:
                     child = parent1.copy()
                 
-                # Mutation
                 mutation_mask = np.random.rand(len(child)) < MUTATION_RATE
                 random_genes = np.random.rand(len(child))
                 child[mutation_mask] = random_genes[mutation_mask]
@@ -247,10 +195,52 @@ class GeneticOptimizer:
             
             self.population = new_pop
             
-        # Return best chromosome
         final_scores = [self.fitness(p) for p in self.population]
         best_chrom = self.population[np.argmax(final_scores)]
         return best_chrom
+
+def plot_candlesticks(df, levels, filename="ohlc.png"):
+    """Manually plots candlesticks to avoid mplfinance dependency"""
+    plt.figure(figsize=(14, 8))
+    
+    # Reset index for easy plotting
+    df_plot = df.reset_index(drop=True)
+    
+    # Define colors
+    up_color = '#2ca02c'   # Green
+    down_color = '#d62728' # Red
+    
+    # Width of candlestick elements
+    width = 0.6
+    width2 = 0.05
+    
+    # Identify up/down days
+    up = df_plot[df_plot.close >= df_plot.open]
+    down = df_plot[df_plot.close < df_plot.open]
+    
+    # Plot Up candles
+    plt.bar(up.index, up.close - up.open, width, bottom=up.open, color=up_color)
+    plt.bar(up.index, up.high - up.close, width2, bottom=up.close, color=up_color)
+    plt.bar(up.index, up.low - up.open, width2, bottom=up.open, color=up_color)
+    
+    # Plot Down candles
+    plt.bar(down.index, down.open - down.close, width, bottom=down.close, color=down_color)
+    plt.bar(down.index, down.high - down.open, width2, bottom=down.open, color=down_color)
+    plt.bar(down.index, down.low - down.close, width2, bottom=down.close, color=down_color)
+
+    # Overlay Levels
+    # We use a secondary axis logic or just plot horizontal lines across the whole range
+    xmin, xmax = 0, len(df_plot)
+    for level in levels:
+        plt.hlines(level, xmin, xmax, colors='blue', linestyles='dashed', alpha=0.6, linewidth=0.8)
+
+    plt.title('Test Data: OHLC & Optimized Price Levels')
+    plt.xlabel('Time (Candles)')
+    plt.ylabel('Price')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
 
 def main():
     # 1. Download Data
@@ -260,8 +250,6 @@ def main():
         raise Exception("Failed to download data")
     
     df = pd.read_csv(io.StringIO(r.text))
-    
-    # Clean column names
     df.columns = [c.lower() for c in df.columns]
     
     # 2. Split Data
@@ -285,7 +273,7 @@ def main():
     # 5. Generate Reports
     os.makedirs("output", exist_ok=True)
     
-    # Plot
+    # Plot Equity
     plt.figure(figsize=(12, 6))
     plt.plot(equity, label='Equity Curve (Test Data)')
     plt.title(f'Strategy Performance (Test Data)\nLevels: {len(best_levels)}')
@@ -294,6 +282,11 @@ def main():
     plt.legend()
     plt.grid(True)
     plt.savefig('output/equity.png')
+    plt.close()
+
+    # Plot OHLC with Levels (Test Data Only for Clarity)
+    print("Generating OHLC plot...")
+    plot_candlesticks(test_df, best_levels, "output/ohlc.png")
     
     # Stats
     total_return = (equity[-1] - 10000) / 10000 * 100
@@ -316,7 +309,10 @@ def main():
         </ul>
         <hr>
         <h2>Equity Curve</h2>
-        <img src="equity.png" style="max-width: 100%;">
+        <img src="equity.png" style="max-width: 100%; border: 1px solid #ddd;">
+        <hr>
+        <h2>Price Action & Levels</h2>
+        <img src="ohlc.png" style="max-width: 100%; border: 1px solid #ddd;">
         <hr>
         <h2>Price Levels</h2>
         <p>{list(np.round(best_levels, 2))}</p>
