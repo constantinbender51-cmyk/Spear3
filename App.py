@@ -334,7 +334,7 @@ def plot_candlesticks(df, levels, filename="ohlc.png"):
 
 def main():
     # 1. Fetch Data
-    df = fetch_binance_data(symbol="BTCUSDT", interval="30m", start_str="2020-01-01")
+    df = fetch_binance_data(symbol="BTCUSDT", interval="30m", start_str="2025-01-01")
     
     # 2. Split Data
     split_idx = int(len(df) * TRAIN_SPLIT)
