@@ -11,7 +11,7 @@ from datetime import datetime
 import random
 
 # --- Configuration ---
-TRAIN_SPLIT = 0.98
+TRAIN_SPLIT = 0.95
 PORT = 8080
 
 # Trading Costs (Fixed)
