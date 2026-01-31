@@ -11,7 +11,7 @@ from datetime import datetime
 import random
 
 # --- Configuration ---
-TRAIN_SPLIT = 0.95
+TRAIN_SPLIT = 0.70  # Modified to 70/30
 PORT = 8080
 
 # Trading Costs (Fixed)
@@ -25,14 +25,19 @@ MUTATION_RATE = 0.1
 CROSSOVER_RATE = 0.7
 
 # Strategy Constraints
-NUM_LEVELS = 50  # Fixed as requested
+NUM_LEVELS = 50 
+
 # Optimization Bounds
 MIN_SL = 0.001   # 0.1%
 MAX_SL = 0.05    # 5.0%
 MIN_TP = 0.005   # 0.5%
 MAX_TP = 0.10    # 10.0%
 
-def fetch_binance_data(symbol="BTCUSDT", interval="30m", start_str="2025-01-01"):
+# SMA Offset Bounds (Percentage from SMA)
+MIN_OFFSET = -0.20  # -20% from SMA
+MAX_OFFSET = 0.20   # +20% from SMA
+
+def fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01"):
     base_url = "https://api.binance.com/api/v3/klines"
     start_dt = datetime.strptime(start_str, "%Y-%m-%d")
     start_ts = int(start_dt.timestamp() * 1000)
@@ -98,28 +103,30 @@ class Backtester:
         self.low = self.df['low'].values
         self.open = self.df['open'].values
         self.close = self.df['close'].values
+        self.sma = self.df['sma'].values  # Load SMA
         self.n = len(df)
 
-    def run(self, price_levels, stop_loss, take_profit):
+    def run(self, level_offsets, stop_loss, take_profit):
         """
-        Executes the strategy with dynamic SL/TP.
+        Executes the strategy with dynamic levels based on SMA offsets.
+        Direction: Breakout (Same direction as touch).
         """
         position = 0
         entry_price = 0.0
         equity = [10000.0]
         trades = []
         
-        if len(price_levels) == 0:
+        if len(level_offsets) == 0:
             return equity, trades
 
-        levels = np.array(price_levels)
+        offsets = np.array(level_offsets)
         
         for t in range(1, self.n):
             current_equity = equity[-1]
             h = self.high[t]
             l = self.low[t]
-            o = self.open[t]
             prev_c = self.close[t-1]
+            current_sma = self.sma[t]
             
             # --- Check Exit ---
             if position != 0:
@@ -166,26 +173,32 @@ class Backtester:
             
             # --- Check Entry ---
             if position == 0:
-                # Filter relevant levels strictly within high/low
-                relevant_levels = levels[(levels >= l) & (levels <= h)]
+                # Calculate dynamic levels for current timestamp
+                # level = SMA * (1 + offset)
+                current_levels = current_sma * (1 + offsets)
                 
-                if len(relevant_levels) > 0:
+                # Filter relevant levels strictly within high/low
+                # Optimization: Vector filtering
+                mask = (current_levels >= l) & (current_levels <= h)
+                
+                if np.any(mask):
+                    relevant_levels = current_levels[mask]
                     for lvl in relevant_levels:
                         if prev_c < lvl <= h:
-                            # Short Trigger
+                            # Cross UP -> LONG (Breakout)
+                            fill_price = lvl
+                            position = 1
+                            entry_price = fill_price * (1 + SLIPPAGE)
+                            current_equity = current_equity * (1 - FEE)
+                            break 
+                        
+                        elif prev_c > lvl >= l:
+                            # Cross DOWN -> SHORT (Breakdown)
                             fill_price = lvl
                             position = -1
                             entry_price = fill_price * (1 - SLIPPAGE) 
                             current_equity = current_equity * (1 - FEE) 
                             break 
-                        
-                        elif prev_c > lvl >= l:
-                            # Long Trigger
-                            fill_price = lvl
-                            position = 1
-                            entry_price = fill_price * (1 + SLIPPAGE)
-                            current_equity = current_equity * (1 - FEE)
-                            break
             
             equity.append(current_equity)
             
@@ -198,13 +211,10 @@ class GeneticOptimizer:
         self.generations = generations
         self.backtester = Backtester(data_train)
         
-        self.min_price = data_train['low'].min()
-        self.max_price = data_train['high'].max()
-        
         # Chromosome Structure:
         # 0: Stop Loss (Normalized)
         # 1: Take Profit (Normalized)
-        # 2 to 51: Price Levels (Normalized, Fixed Count 50)
+        # 2 to 51: Price Level Offsets (Normalized, Fixed Count 50)
         self.gene_length = 2 + NUM_LEVELS
         self.population = np.random.rand(pop_size, self.gene_length)
         
@@ -217,16 +227,17 @@ class GeneticOptimizer:
         tp_norm = chrom[1]
         take_profit = MIN_TP + tp_norm * (MAX_TP - MIN_TP)
         
-        # 3. Decode Levels
-        levels_norm = chrom[2:]
-        prices = self.min_price + levels_norm * (self.max_price - self.min_price)
-        prices.sort()
+        # 3. Decode Level Offsets (Percentage from SMA)
+        # Maps 0..1 to MIN_OFFSET..MAX_OFFSET
+        offsets_norm = chrom[2:]
+        offsets = MIN_OFFSET + offsets_norm * (MAX_OFFSET - MIN_OFFSET)
+        offsets.sort()
         
-        return prices, stop_loss, take_profit
+        return offsets, stop_loss, take_profit
 
     def fitness(self, chrom):
-        levels, sl, tp = self.decode_chromosome(chrom)
-        equity, trades = self.backtester.run(levels, sl, tp)
+        offsets, sl, tp = self.decode_chromosome(chrom)
+        equity, trades = self.backtester.run(offsets, sl, tp)
         
         # Penalize insufficient data points or bankruptcy
         if len(trades) < 2 or equity[-1] <= 100.0:
@@ -242,16 +253,17 @@ class GeneticOptimizer:
             return -10.0
         
         # Sharpe Ratio Calculation
-        # Annualization factor for 30m candles: 2 (per hour) * 24 * 365 = 17520
-        annualization_factor = np.sqrt(17520)
+        # Annualization factor for 1h candles: sqrt(24 * 365) = 93.59
+        annualization_factor = np.sqrt(24 * 365)
         sharpe = (np.mean(returns) / std_dev) * annualization_factor
         
         return sharpe
 
     def evolve(self):
         print(f"Starting Optimization: {self.generations} Gens, Pop {self.pop_size}, Levels {NUM_LEVELS}")
-        print(f"Optimizing for Sharpe Ratio (30m timeframe)")
+        print(f"Optimizing for Sharpe Ratio (1h timeframe)")
         print(f"Ranges: SL ({MIN_SL*100}%-{MAX_SL*100}%) | TP ({MIN_TP*100}%-{MAX_TP*100}%)")
+        print(f"SMA Offsets: {MIN_OFFSET*100}% to {MAX_OFFSET*100}%")
         
         for gen in range(self.generations):
             scores = []
@@ -300,7 +312,7 @@ class GeneticOptimizer:
         best_chrom = self.population[np.argmax(final_scores)]
         return best_chrom
 
-def plot_candlesticks(df, levels, filename="ohlc.png"):
+def plot_candlesticks(df, filename="ohlc.png"):
     plt.figure(figsize=(14, 8))
     df_plot = df.reset_index(drop=True)
     
@@ -320,13 +332,14 @@ def plot_candlesticks(df, levels, filename="ohlc.png"):
     plt.bar(down.index, down.high - down.open, width2, bottom=down.open, color=down_color)
     plt.bar(down.index, down.low - down.close, width2, bottom=down.close, color=down_color)
 
-    xmin, xmax = 0, len(df_plot)
-    for level in levels:
-        plt.hlines(level, xmin, xmax, colors='blue', linestyles='dashed', alpha=0.5, linewidth=0.8)
+    # Plot SMA
+    if 'sma' in df_plot.columns:
+        plt.plot(df_plot.index, df_plot['sma'], color='blue', label='SMA 365', linewidth=1.5)
 
-    plt.title('Test Data: OHLC & Optimized Price Levels')
+    plt.title('Test Data: OHLC & SMA 365')
     plt.xlabel('Time (Candles)')
     plt.ylabel('Price')
+    plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(filename)
@@ -334,34 +347,41 @@ def plot_candlesticks(df, levels, filename="ohlc.png"):
 
 def main():
     # 1. Fetch Data
-    df = fetch_binance_data(symbol="BTCUSDT", interval="30m", start_str="2025-01-01")
+    df = fetch_binance_data(symbol="BTCUSDT", interval="1h", start_str="2020-01-01")
     
-    # 2. Split Data
+    # 2. Preprocess SMA
+    print("Calculating SMA 365...")
+    df['sma'] = df['close'].rolling(window=365).mean()
+    # Drop initial NaNs
+    df.dropna(inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    
+    # 3. Split Data
     split_idx = int(len(df) * TRAIN_SPLIT)
     train_df = df.iloc[:split_idx]
     test_df = df.iloc[split_idx:]
     
-    print(f"Data loaded. Train size: {len(train_df)}, Test size: {len(test_df)}")
+    print(f"Data prepared. Train size: {len(train_df)}, Test size: {len(test_df)}")
     
-    # 3. Optimize (GA)
+    # 4. Optimize (GA)
     optimizer = GeneticOptimizer(train_df)
     best_chrom = optimizer.evolve()
-    best_levels, best_sl, best_tp = optimizer.decode_chromosome(best_chrom)
+    best_offsets, best_sl, best_tp = optimizer.decode_chromosome(best_chrom)
     
     print(f"Optimization complete.")
     print(f"Best SL: {best_sl*100:.2f}%")
     print(f"Best TP: {best_tp*100:.2f}%")
     
-    # 4. Test on Out-of-Sample Data
+    # 5. Test on Out-of-Sample Data
     bt = Backtester(test_df)
-    equity, trades = bt.run(best_levels, best_sl, best_tp)
+    equity, trades = bt.run(best_offsets, best_sl, best_tp)
     
-    # 5. Generate Reports
+    # 6. Generate Reports
     os.makedirs("output", exist_ok=True)
     
     plt.figure(figsize=(12, 6))
     plt.plot(equity, label='Equity Curve (Test Data)')
-    plt.title(f'Strategy Performance (Test Data)\nLevels: {len(best_levels)} | SL: {best_sl*100:.2f}% | TP: {best_tp*100:.2f}%')
+    plt.title(f'Strategy Performance (Test Data)\nSMA Offsets: {len(best_offsets)} | SL: {best_sl*100:.2f}% | TP: {best_tp*100:.2f}%')
     plt.xlabel('Candles')
     plt.ylabel('Capital ($)')
     plt.legend()
@@ -370,7 +390,7 @@ def main():
     plt.close()
 
     print("Generating OHLC plot...")
-    plot_candlesticks(test_df, best_levels, "output/ohlc.png")
+    plot_candlesticks(test_df, "output/ohlc.png")
     
     total_return = (equity[-1] - 10000) / 10000 * 100
     win_rate = len([t for t in trades if t > 0]) / len(trades) * 100 if trades else 0
@@ -381,7 +401,7 @@ def main():
     <body style="font-family: monospace; padding: 20px;">
         <h1>Optimization Results</h1>
         <hr>
-        <h2>Metrics (Test Set 10%)</h2>
+        <h2>Metrics (Test Set {100-TRAIN_SPLIT*100:.0f}%)</h2>
         <ul>
             <li>Initial Capital: $10,000</li>
             <li>Final Capital: ${equity[-1]:.2f}</li>
@@ -395,11 +415,11 @@ def main():
         <h2>Equity Curve</h2>
         <img src="equity.png" style="max-width: 100%; border: 1px solid #ddd;">
         <hr>
-        <h2>Price Action & Levels</h2>
+        <h2>Price Action & SMA</h2>
         <img src="ohlc.png" style="max-width: 100%; border: 1px solid #ddd;">
         <hr>
-        <h2>Price Levels</h2>
-        <p>{list(np.round(best_levels, 2))}</p>
+        <h2>SMA Offset Levels (%)</h2>
+        <p>{list(np.round(best_offsets * 100, 2))}</p>
     </body>
     </html>
     """
